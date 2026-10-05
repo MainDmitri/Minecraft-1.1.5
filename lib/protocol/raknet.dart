@@ -312,6 +312,7 @@ class RakNetClient {
   StreamSubscription<RawSocketEvent>? _sub;
   late InternetAddress _address;
   int _mtu = 576;
+  int? _cookie;
   bool _connected = false;
   bool _closed = false;
   Completer<void>? _connectCompleter;
@@ -403,6 +404,12 @@ class RakNetClient {
       final w = BinaryWriter()
         ..byte(RakId.openConnectionRequest2)
         ..bytes(rakMagic);
+      final cookie = _cookie;
+      if (cookie != null) {
+        w
+          ..intBE(cookie)
+          ..byte(0); // клиент не отвечает на криптографический вызов
+      }
       _writeAddress(w, _address, port);
       w
         ..shortBE(_mtu)
@@ -496,10 +503,13 @@ class RakNetClient {
         r.skip(16);
         r.longBE();
         final security = r.boolean();
-        if (security) {
-          _failConnect('Сервер требует RakNet-безопасность, она не поддерживается');
+        // Новые серверы присылают cookie (защита от подмены адреса); его нужно вернуть в запросе 2.
+        // Полноценная RakNet-безопасность с ключами передаёт больше данных и не поддерживается.
+        if (security && r.remaining != 6) {
+          _failConnect('Сервер требует RakNet-безопасность с ключами, она не поддерживается');
           return;
         }
+        _cookie = security ? r.intBE() : null;
         _mtu = min(r.shortBE(), 1492);
         if (!_offlineStep!.isCompleted) _offlineStep!.complete();
         break;
