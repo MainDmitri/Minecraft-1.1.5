@@ -21,11 +21,21 @@ class PacketId {
   static const addPlayer = 0x0c;
   static const removeEntity = 0x0e;
   static const movePlayer = 0x13;
+  static const removeBlock = 0x15;
+  static const updateBlock = 0x16;
+  static const levelEvent = 0x1a;
   static const updateAttributes = 0x1e;
+  static const mobEquipment = 0x1f;
+  static const useItem = 0x23;
   static const playerAction = 0x24;
   static const setSpawnPosition = 0x2b;
   static const respawn = 0x2d;
+  static const containerSetSlot = 0x32;
+  static const containerSetContent = 0x34;
+  static const adventureSettings = 0x37;
+  static const fullChunkData = 0x3a;
   static const setDifficulty = 0x3c;
+  static const changeDimension = 0x3d;
   static const setPlayerGameType = 0x3e;
   static const playerList = 0x3f;
   static const requestChunkRadius = 0x45;
@@ -58,7 +68,49 @@ class TextType {
 }
 
 class PlayerActionType {
+  static const startBreak = 0;
+  static const abortBreak = 1;
+  static const stopBreak = 2;
   static const respawn = 7;
+}
+
+class LevelEventId {
+  static const blockStartBreak = 3600;
+}
+
+/// Предмет в слоте. [raw] — байты слота как их прислал сервер: при отправке обратно
+/// сервер сравнивает предмет побайтно, поэтому он пересылается без изменений.
+class ItemStack {
+  ItemStack(this.id, this.meta, this.count, this.raw);
+
+  final int id;
+  final int meta;
+  final int count;
+  final Uint8List raw;
+
+  static final ItemStack empty = ItemStack(0, 0, 0, Uint8List.fromList(const [0]));
+
+  bool get isEmpty => id <= 0 || count <= 0;
+}
+
+ItemStack readItem(BinaryReader r) {
+  final start = r.offset;
+  final id = r.varint();
+  if (id <= 0) {
+    return ItemStack(0, 0, 0, Uint8List.fromList(r.data.sublist(start, r.offset)));
+  }
+  final aux = r.varint();
+  final nbtLength = r.shortLE();
+  if (nbtLength > 0) r.skip(nbtLength);
+  final canPlaceOn = r.varint();
+  for (var i = 0; i < canPlaceOn; i++) {
+    r.string();
+  }
+  final canDestroy = r.varint();
+  for (var i = 0; i < canDestroy; i++) {
+    r.string();
+  }
+  return ItemStack(id, (aux >> 8) & 0x7fff, aux & 0xff, Uint8List.fromList(r.data.sublist(start, r.offset)));
 }
 
 class Vec3 {
@@ -366,7 +418,7 @@ Uint8List buildChat(String source, String message) => encodePacket(PacketId.text
         ..string(message);
     });
 
-Uint8List buildPlayerAction(int runtimeIdRaw, int action, int x, int y, int z) =>
+Uint8List buildPlayerAction(int runtimeIdRaw, int action, int x, int y, int z, {int face = 0}) =>
     encodePacket(PacketId.playerAction, (w) {
       w
         ..uvarint(runtimeIdRaw)
@@ -374,7 +426,76 @@ Uint8List buildPlayerAction(int runtimeIdRaw, int action, int x, int y, int z) =
         ..varint(x)
         ..uvarint(y < 0 ? 0 : y)
         ..varint(z)
-        ..varint(0);
+        ..varint(face);
+    });
+
+Uint8List buildAdventureSettings(int flags, int permission) => encodePacket(PacketId.adventureSettings, (w) {
+      w
+        ..uvarint(flags)
+        ..uvarint(permission);
+    });
+
+/// Позиция игрока: [eye] — координаты глаз.
+Uint8List buildMovePlayer(int runtimeIdRaw, Vec3 eye, double pitch, double yaw, bool onGround) =>
+    encodePacket(PacketId.movePlayer, (w) {
+      w
+        ..uvarint(runtimeIdRaw)
+        ..floatLE(eye.x)
+        ..floatLE(eye.y)
+        ..floatLE(eye.z)
+        ..floatLE(pitch)
+        ..floatLE(yaw)
+        ..floatLE(yaw)
+        ..byte(0)
+        ..boolean(onGround)
+        ..uvarint(0);
+    });
+
+Uint8List buildRemoveBlock(int x, int y, int z) => encodePacket(PacketId.removeBlock, (w) {
+      w
+        ..varint(x)
+        ..uvarint(y)
+        ..varint(z);
+    });
+
+Uint8List buildUseItem({
+  required int x,
+  required int y,
+  required int z,
+  required int targetBlockId,
+  required int face,
+  required double fx,
+  required double fy,
+  required double fz,
+  required Vec3 eye,
+  required int hotbarSlot,
+  required ItemStack item,
+}) =>
+    encodePacket(PacketId.useItem, (w) {
+      w
+        ..varint(x)
+        ..uvarint(y)
+        ..varint(z)
+        ..uvarint(targetBlockId)
+        ..varint(face)
+        ..floatLE(fx)
+        ..floatLE(fy)
+        ..floatLE(fz)
+        ..floatLE(eye.x)
+        ..floatLE(eye.y)
+        ..floatLE(eye.z)
+        ..byte(hotbarSlot)
+        ..bytes(item.raw);
+    });
+
+Uint8List buildMobEquipment(int runtimeIdRaw, ItemStack item, int inventorySlot, int hotbarSlot) =>
+    encodePacket(PacketId.mobEquipment, (w) {
+      w
+        ..uvarint(runtimeIdRaw)
+        ..bytes(item.raw)
+        ..byte(inventorySlot)
+        ..byte(hotbarSlot)
+        ..byte(0);
     });
 
 Uint8List buildCommandStep({

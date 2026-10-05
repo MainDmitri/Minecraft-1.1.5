@@ -9,6 +9,10 @@ import '../protocol/login.dart';
 import '../protocol/packets.dart';
 import '../protocol/raknet.dart';
 import '../protocol/skin.dart';
+import '../world/blocks.dart';
+import '../world/player.dart';
+import '../world/renderer.dart';
+import '../world/world.dart';
 import 'commands.dart';
 import 'lang.dart';
 
@@ -30,7 +34,15 @@ class OnlinePlayer {
   final String uuid;
   final int uniqueId;
   final String name;
-  Vec3? position;
+}
+
+/// Другой игрок, видимый в мире (по AddPlayer). Позиция — ноги.
+class RemotePlayer {
+  RemotePlayer(this.uniqueId, this.name, this.position);
+
+  final int uniqueId;
+  final String name;
+  Vec3 position;
 }
 
 /// Сообщение на экране (заголовок, подзаголовок, всплывающая подсказка).
@@ -50,7 +62,7 @@ class TransferTarget {
   final int port;
 }
 
-/// Сетевой клиент MCPE 1.1.x (протокол 113).
+/// Сетевой клиент MCPE 1.1.x (протокол 113) с миром и локальной физикой игрока.
 class McpeClient {
   McpeClient({
     required this.host,
@@ -72,13 +84,15 @@ class McpeClient {
 
   final StreamController<void> _changes = StreamController<void>.broadcast();
 
-  /// Срабатывает при любом изменении состояния.
+  /// Срабатывает при изменении состояния, важного для интерфейса.
   Stream<void> get changes => _changes.stream;
 
   RakNetClient? _rak;
   PacketCipher? _cipher;
   LoginData? _login;
   Completer<void>? _spawned;
+  Timer? _tickTimer;
+  int _tickCount = 0;
 
   ConnectionPhase phase = ConnectionPhase.idle;
   String? disconnectReason;
@@ -89,20 +103,50 @@ class McpeClient {
   static const _chatLimit = 500;
 
   final Map<String, OnlinePlayer> players = {};
-  final Map<int, int> _runtimeToUnique = {};
+  final Map<int, RemotePlayer> remotePlayers = {};
   final CommandRegistry commands = CommandRegistry();
 
-  StartGameData? world;
+  final World level = World();
+  final PlayerController player = PlayerController();
+
+  /// Время последнего тика физики — для плавной интерполяции камеры.
+  DateTime lastTick = DateTime.now();
+  double prevX = 0, prevY = 0, prevZ = 0;
+  bool hasPosition = false;
+
+  StartGameData? startGame;
   int? _runtimeId;
-  Vec3? position;
   int gamemode = 0;
   int difficulty = 0;
   int worldTime = 0;
+  int serverChunkRadius = 5;
   double health = 20;
   double maxHealth = 20;
   double food = 20;
   int xpLevel = 0;
   bool dead = false;
+
+  int _adventureFlags = 0;
+  int _permission = 0;
+  bool get allowFlight => (_adventureFlags & (1 << 6)) != 0;
+
+  // Инвентарь.
+  List<ItemStack> inventory = [];
+  List<int> hotbarLinks = List.filled(9, -1);
+  List<ItemStack> creativeItems = [];
+  int selectedHotbar = 0;
+  ItemStack heldItem = ItemStack.empty;
+
+  // Ломание блока.
+  bool _breakHeld = false;
+  DateTime _nextBreakAt = DateTime(0);
+  BlockPos? breakingBlock;
+  int _breakFace = 0;
+  DateTime? _breakStart;
+  Duration? _breakDuration;
+
+  // Последняя отправленная позиция.
+  double _sentX = 0, _sentY = 0, _sentZ = 0, _sentYaw = 0, _sentPitch = 0;
 
   ScreenMessage? title;
   ScreenMessage? subtitle;
@@ -114,6 +158,27 @@ class McpeClient {
   int _titleFadeOut = 20;
 
   int get latencyMs => _rak?.latencyMs ?? 0;
+
+  bool get isCreative => gamemode == 1;
+
+  /// Позиция ног игрока.
+  Vec3? get position => hasPosition ? Vec3(player.x, player.y, player.z) : null;
+
+  /// Доля завершения ломания (0..1) или null.
+  double? get breakProgress {
+    final start = _breakStart, duration = _breakDuration;
+    if (breakingBlock == null || start == null) return null;
+    if (duration == null) return 0;
+    if (duration == Duration.zero) return 1;
+    return (DateTime.now().difference(start).inMilliseconds / duration.inMilliseconds).clamp(0.0, 1.0);
+  }
+
+  ItemStack hotbarItem(int index) {
+    final link = hotbarLinks[index];
+    final slot = link - 9;
+    if (link < 9 || slot >= inventory.length) return ItemStack.empty;
+    return inventory[slot];
+  }
 
   void _notify() {
     if (!_changes.isClosed) _changes.add(null);
@@ -165,6 +230,7 @@ class McpeClient {
     if (phase == ConnectionPhase.disconnected) return;
     phase = ConnectionPhase.disconnected;
     disconnectReason = reason;
+    _tickTimer?.cancel();
     if (_spawned != null && !_spawned!.isCompleted) {
       _spawned!.completeError(RakNetException(reason));
     }
@@ -178,6 +244,7 @@ class McpeClient {
 
   void dispose() {
     disconnect('Сессия закрыта');
+    _tickTimer?.cancel();
     _changes.close();
   }
 
@@ -257,39 +324,82 @@ class McpeClient {
         final uniqueId = r.varint();
         final runtimeId = r.uvarint();
         final pos = Vec3.read(r);
-        _runtimeToUnique[runtimeId] = uniqueId;
-        for (final p in players.values) {
-          if (p.uniqueId == uniqueId || (p.uniqueId == 0 && p.name == name)) p.position = pos;
-        }
+        remotePlayers[runtimeId] = RemotePlayer(uniqueId, name, pos);
         _notify();
         break;
       case PacketId.removeEntity:
         final uniqueId = r.varint();
-        _runtimeToUnique.removeWhere((_, u) => u == uniqueId);
-        for (final p in players.values) {
-          if (p.uniqueId == uniqueId) p.position = null;
-        }
+        remotePlayers.removeWhere((_, p) => p.uniqueId == uniqueId);
         _notify();
         break;
       case PacketId.movePlayer:
         final move = MovePlayerData.read(r);
         if (move.runtimeIdRaw == _runtimeId) {
-          position = move.position;
+          _teleport(move.position);
         } else {
-          final uniqueId = _runtimeToUnique[move.runtimeIdRaw];
-          for (final p in players.values) {
-            if (uniqueId != null && p.uniqueId == uniqueId) p.position = move.position;
+          final remote = remotePlayers[move.runtimeIdRaw];
+          if (remote != null) {
+            remote.position = Vec3(move.position.x, move.position.y - eyeHeight, move.position.z);
           }
         }
-        _notify();
+        break;
+      case PacketId.updateBlock:
+        final x = r.varint(), y = r.uvarint(), z = r.varint();
+        final blockId = r.uvarint();
+        final flagsMeta = r.uvarint();
+        level.setBlock(x, y, z, blockId, flagsMeta & 0x0f);
+        break;
+      case PacketId.levelEvent:
+        _onLevelEvent(r.varint(), Vec3.read(r), r.varint());
         break;
       case PacketId.updateAttributes:
         final runtimeId = r.uvarint();
         if (runtimeId == _runtimeId) _onAttributes(readAttributes(r));
         break;
+      case PacketId.mobEquipment:
+        final runtimeId = r.uvarint();
+        final item = readItem(r);
+        r.byte(); // слот инвентаря
+        final selected = r.byte();
+        if (runtimeId == _runtimeId || runtimeId == 0) {
+          heldItem = item;
+          if (selected < 9) selectedHotbar = selected;
+          _notify();
+        }
+        break;
       case PacketId.respawn:
-        position = Vec3.read(r);
+        _teleportAmbiguous(Vec3.read(r));
+        break;
+      case PacketId.containerSetSlot:
+        final window = r.byte();
+        final slot = r.varint();
+        r.varint(); // слот хотбара
+        final item = readItem(r);
+        if (window == 0 && slot >= 0) {
+          if (slot >= inventory.length) {
+            inventory = [...inventory, ...List.filled(slot + 1 - inventory.length, ItemStack.empty)];
+          }
+          inventory[slot] = item;
+          _notify();
+        }
+        break;
+      case PacketId.containerSetContent:
+        _onContainerContent(r);
+        break;
+      case PacketId.adventureSettings:
+        _adventureFlags = r.uvarint();
+        _permission = r.uvarint();
+        if (!allowFlight) player.flying = false;
         _notify();
+        break;
+      case PacketId.fullChunkData:
+        final cx = r.varint(), cz = r.varint();
+        level.putChunk(Chunk.parse(cx, cz, r.byteArray()));
+        _resolveSpawn();
+        break;
+      case PacketId.changeDimension:
+        level.clear();
+        remotePlayers.clear();
         break;
       case PacketId.setDifficulty:
         difficulty = r.uvarint();
@@ -297,10 +407,14 @@ class McpeClient {
         break;
       case PacketId.setPlayerGameType:
         gamemode = r.varint();
+        if (gamemode != 1) player.flying = false;
         _notify();
         break;
       case PacketId.playerList:
         _onPlayerList(PlayerListUpdate.read(r));
+        break;
+      case PacketId.chunkRadiusUpdated:
+        serverChunkRadius = r.varint();
         break;
       case PacketId.availableCommands:
         try {
@@ -324,6 +438,30 @@ class McpeClient {
     }
   }
 
+  void _onContainerContent(BinaryReader r) {
+    final window = r.uvarint();
+    r.uvarint(); // ID сущности
+    final count = r.uvarint();
+    final items = <ItemStack>[];
+    for (var i = 0; i < count; i++) {
+      items.add(readItem(r));
+    }
+    final hotbarCount = r.eof ? 0 : r.uvarint();
+    final hotbar = <int>[];
+    for (var i = 0; i < hotbarCount; i++) {
+      hotbar.add(r.varint());
+    }
+    if (window == 0) {
+      inventory = items;
+      if (hotbar.isNotEmpty) {
+        hotbarLinks = List.generate(9, (i) => i < hotbar.length ? hotbar[i] : -1);
+      }
+    } else if (window == 0x79) {
+      creativeItems = items.where((i) => !i.isEmpty).toList();
+    }
+    _notify();
+  }
+
   void _onPlayStatus(int status) {
     switch (status) {
       case PlayStatus.loginSuccess:
@@ -332,6 +470,8 @@ class McpeClient {
       case PlayStatus.playerSpawn:
         phase = ConnectionPhase.playing;
         _addChat('Вы в игре', ChatKind.local);
+        _tickTimer?.cancel();
+        _tickTimer = Timer.periodic(const Duration(milliseconds: 50), (_) => _tick());
         if (_spawned != null && !_spawned!.isCompleted) _spawned!.complete();
         break;
       case PlayStatus.loginFailedClient:
@@ -379,15 +519,60 @@ class McpeClient {
   }
 
   void _onStartGame(StartGameData data) {
-    world = data;
+    startGame = data;
     _runtimeId = data.runtimeIdRaw;
-    position = data.position;
+    level.clear();
+    remotePlayers.clear();
+    player.yaw = data.yaw;
+    player.pitch = data.pitch;
+    _teleportAmbiguous(data.position);
     gamemode = data.playerGamemode;
     difficulty = data.difficulty;
     worldTime = data.time;
     phase = ConnectionPhase.spawning;
     _sendPacket(buildRequestChunkRadius(chunkRadius));
     _notify();
+  }
+
+  Vec3? _ambiguousSpawn;
+
+  /// StartGame и Respawn: PocketMine присылает координаты глаз, Nukkit — ног.
+  /// Сначала считаем их глазами; когда чанк загружен, проверяем, не оказался ли игрок в блоках.
+  void _teleportAmbiguous(Vec3 pos) {
+    _teleport(pos);
+    _ambiguousSpawn = pos;
+    _resolveSpawn();
+  }
+
+  void _resolveSpawn() {
+    final pos = _ambiguousSpawn;
+    if (pos == null || !level.isLoaded(pos.x.floor(), pos.z.floor())) return;
+    _ambiguousSpawn = null;
+    if (player.collidesAt(level, pos.x, pos.y - eyeHeight, pos.z) && !player.collidesAt(level, pos.x, pos.y, pos.z)) {
+      _teleport(Vec3(pos.x, pos.y + eyeHeight, pos.z));
+    }
+  }
+
+  /// Позиция от сервера (координаты глаз).
+  void _teleport(Vec3 eye) {
+    _ambiguousSpawn = null;
+    player.setEyePosition(eye.x, eye.y, eye.z);
+    prevX = player.x;
+    prevY = player.y;
+    prevZ = player.z;
+    _sentX = player.x;
+    _sentY = player.y;
+    _sentZ = player.z;
+    hasPosition = true;
+    _notify();
+  }
+
+  void _onLevelEvent(int event, Vec3 pos, int data) {
+    final b = breakingBlock;
+    if (event != LevelEventId.blockStartBreak || b == null || data <= 0) return;
+    if (pos.x.floor() == b.x && pos.y.floor() == b.y && pos.z.floor() == b.z) {
+      _breakDuration = Duration(milliseconds: (65535 / data * 50).round());
+    }
   }
 
   void _onText(TextMessage m) {
@@ -425,7 +610,10 @@ class McpeClient {
           maxHealth = a.max;
           final wasDead = dead;
           dead = a.value <= 0;
-          if (dead && !wasDead) _addChat('Вы погибли', ChatKind.local);
+          if (dead && !wasDead) {
+            _addChat('Вы погибли', ChatKind.local);
+            setBreaking(false);
+          }
           break;
         case 'minecraft:player.hunger':
           food = a.value;
@@ -441,8 +629,7 @@ class McpeClient {
   void _onPlayerList(PlayerListUpdate u) {
     if (u.add) {
       for (final e in u.entries) {
-        final existing = players[e.uuid];
-        players[e.uuid] = OnlinePlayer(e.uuid, e.uniqueId, e.name)..position = existing?.position;
+        players[e.uuid] = OnlinePlayer(e.uuid, e.uniqueId, e.name);
       }
     } else {
       for (final uuid in u.removed) {
@@ -483,7 +670,162 @@ class McpeClient {
     _notify();
   }
 
+  // ---------- Игровой цикл ----------
+
+  void _tick() {
+    if (phase != ConnectionPhase.playing || !hasPosition) return;
+    _tickCount++;
+    prevX = player.x;
+    prevY = player.y;
+    prevZ = player.z;
+    lastTick = DateTime.now();
+    if (!dead) {
+      player.tick(level);
+      _sendMovement();
+      _updateBreaking();
+    }
+    if (_tickCount % 40 == 0) {
+      level.unloadFar(player.x.floor() >> 4, player.z.floor() >> 4, serverChunkRadius + 3);
+    }
+    if (_tickCount % 5 == 0) _notify();
+  }
+
+  void _sendMovement() {
+    final id = _runtimeId;
+    if (id == null) return;
+    final moved = (player.x - _sentX).abs() > 1e-3 || (player.y - _sentY).abs() > 1e-3 || (player.z - _sentZ).abs() > 1e-3;
+    final turned = (player.yaw - _sentYaw).abs() > 0.5 || (player.pitch - _sentPitch).abs() > 0.5;
+    if (!moved && !turned) return;
+    _sentX = player.x;
+    _sentY = player.y;
+    _sentZ = player.z;
+    _sentYaw = player.yaw;
+    _sentPitch = player.pitch;
+    _sendPacket(buildMovePlayer(id, Vec3(player.x, player.eyeY, player.z), player.pitch, _normalizedYaw, player.onGround));
+  }
+
+  double get _normalizedYaw {
+    final y = player.yaw % 360;
+    return y < 0 ? y + 360 : y;
+  }
+
+  double get _reach => isCreative ? 7 : 5;
+
   // ---------- Действия игрока ----------
+
+  /// Кнопка «ломать» нажата или отпущена.
+  void setBreaking(bool pressed) {
+    if (pressed) {
+      if (phase != ConnectionPhase.playing || dead) return;
+      _breakHeld = true;
+      _beginBreak();
+      return;
+    }
+    _breakHeld = false;
+    final id = _runtimeId;
+    final b = breakingBlock;
+    if (b != null && id != null) {
+      _sendPacket(buildPlayerAction(id, PlayerActionType.abortBreak, b.x, b.y, b.z, face: _breakFace));
+    }
+    breakingBlock = null;
+    _breakStart = null;
+    _notify();
+  }
+
+  void _beginBreak() {
+    final id = _runtimeId;
+    final hit = player.raycast(level, _reach);
+    if (id == null || hit == null) {
+      breakingBlock = null;
+      return;
+    }
+    breakingBlock = hit.block;
+    _breakFace = hit.face;
+    _breakStart = DateTime.now();
+    _breakDuration = isCreative ? Duration.zero : null;
+    _sendPacket(buildPlayerAction(id, PlayerActionType.startBreak, hit.block.x, hit.block.y, hit.block.z, face: hit.face));
+  }
+
+  void _updateBreaking() {
+    final b = breakingBlock;
+    final id = _runtimeId;
+    if (!_breakHeld || id == null) return;
+    final now = DateTime.now();
+    if (b == null) {
+      if (now.isAfter(_nextBreakAt)) _beginBreak();
+      return;
+    }
+    final hit = player.raycast(level, _reach);
+    if (hit == null || hit.block != b) {
+      _sendPacket(buildPlayerAction(id, PlayerActionType.abortBreak, b.x, b.y, b.z, face: _breakFace));
+      _beginBreak();
+      return;
+    }
+    final elapsed = now.difference(_breakStart!);
+    // Сервер не прислал время ломания — значит, блок ломается мгновенно.
+    if (_breakDuration == null && elapsed > const Duration(milliseconds: 400)) _breakDuration = Duration.zero;
+    final duration = _breakDuration;
+    if (duration == null || elapsed < duration) return;
+    _sendPacket(buildPlayerAction(id, PlayerActionType.stopBreak, b.x, b.y, b.z, face: _breakFace));
+    _sendPacket(buildRemoveBlock(b.x, b.y, b.z));
+    level.setBlock(b.x, b.y, b.z, 0, 0);
+    breakingBlock = null;
+    _breakStart = null;
+    // В творчестве блоки ломаются мгновенно — пауза, чтобы не снести всё подряд.
+    _nextBreakAt = now.add(Duration(milliseconds: isCreative ? 250 : 0));
+  }
+
+  /// Использовать предмет в руке на блок (поставить блок, открыть дверь и т. п.).
+  void useItemOnBlock() {
+    final id = _runtimeId;
+    if (id == null || phase != ConnectionPhase.playing || dead) return;
+    final hit = player.raycast(level, _reach);
+    if (hit == null) return;
+    final item = heldItem;
+    if (!item.isEmpty && item.id < 256 && blockTable[item.id].solid && player.intersects(hit.adjacent)) return;
+    _sendPacket(buildUseItem(
+      x: hit.block.x,
+      y: hit.block.y,
+      z: hit.block.z,
+      targetBlockId: level.blockId(hit.block.x, hit.block.y, hit.block.z),
+      face: hit.face,
+      fx: hit.fx,
+      fy: hit.fy,
+      fz: hit.fz,
+      eye: Vec3(player.x, player.eyeY, player.z),
+      hotbarSlot: selectedHotbar,
+      item: item,
+    ));
+  }
+
+  void selectHotbar(int index) {
+    final id = _runtimeId;
+    if (id == null || index < 0 || index > 8) return;
+    final link = hotbarLinks[index];
+    final item = hotbarItem(index);
+    selectedHotbar = index;
+    heldItem = item;
+    _sendPacket(buildMobEquipment(id, item, link < 9 ? 255 : link, index));
+    _notify();
+  }
+
+  /// Творчество: взять предмет из творческого инвентаря в выбранный слот хотбара.
+  void takeCreativeItem(ItemStack item) {
+    final id = _runtimeId;
+    if (id == null || !isCreative) return;
+    heldItem = item;
+    _sendPacket(buildMobEquipment(id, item, selectedHotbar + 9, selectedHotbar));
+    _notify();
+  }
+
+  void toggleFlight() {
+    if (!allowFlight) return;
+    player.flying = !player.flying;
+    final flags = player.flying ? _adventureFlags | (1 << 9) : _adventureFlags & ~(1 << 9);
+    _adventureFlags = flags;
+    _sendPacket(buildAdventureSettings(flags, _permission));
+    _notify();
+  }
 
   /// Отправить сообщение в чат или команду (строка начинается с '/').
   void sendMessage(String text) {
@@ -514,7 +856,6 @@ class McpeClient {
   void respawn() {
     final id = _runtimeId;
     if (id == null || !dead) return;
-    final pos = position ?? const Vec3(0, 0, 0);
-    _sendPacket(buildPlayerAction(id, PlayerActionType.respawn, pos.x.floor(), pos.y.floor(), pos.z.floor()));
+    _sendPacket(buildPlayerAction(id, PlayerActionType.respawn, player.x.floor(), player.y.floor(), player.z.floor()));
   }
 }

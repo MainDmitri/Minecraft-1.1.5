@@ -25,6 +25,10 @@ class SettingsStore extends ChangeNotifier {
   static const _kNickname = 'nickname';
   static const _kServers = 'servers';
   static const _kSkin = 'skin_rgba';
+  static const _kRenderDistance = 'render_distance';
+
+  /// Допустимая дальность прорисовки в блоках.
+  static const renderDistances = [16, 24, 32, 48, 64];
 
   SharedPreferences? _prefs;
 
@@ -32,12 +36,15 @@ class SettingsStore extends ChangeNotifier {
   List<ServerEntry> servers = [];
   SkinData skin = SkinData.generated();
   bool customSkin = false;
+  int renderDistance = 32;
   bool loaded = false;
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     _prefs = prefs;
     nickname = prefs.getString(_kNickname) ?? '';
+    final distance = prefs.getInt(_kRenderDistance);
+    if (distance != null && renderDistances.contains(distance)) renderDistance = distance;
     final raw = prefs.getString(_kServers);
     if (raw != null) {
       final list = jsonDecode(raw) as List;
@@ -58,6 +65,12 @@ class SettingsStore extends ChangeNotifier {
   Future<void> setNickname(String value) async {
     nickname = value;
     await _prefs?.setString(_kNickname, value);
+    notifyListeners();
+  }
+
+  Future<void> setRenderDistance(int value) async {
+    renderDistance = value;
+    await _prefs?.setInt(_kRenderDistance, value);
     notifyListeners();
   }
 

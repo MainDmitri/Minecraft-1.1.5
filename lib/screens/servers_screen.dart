@@ -130,6 +130,22 @@ class _ServersScreenState extends State<ServersScreen> {
               ),
             ),
           ),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.visibility),
+              title: const Text('Дальность прорисовки'),
+              subtitle: const Text('Меньше — быстрее на слабых телефонах'),
+              trailing: DropdownButton<int>(
+                value: store.renderDistance,
+                items: [
+                  for (final d in SettingsStore.renderDistances) DropdownMenuItem(value: d, child: Text('$d бл.')),
+                ],
+                onChanged: (v) {
+                  if (v != null) store.setRenderDistance(v);
+                },
+              ),
+            ),
+          ),
           const SizedBox(height: 16),
           if (store.servers.isEmpty)
             const Padding(

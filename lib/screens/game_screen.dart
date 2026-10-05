@@ -7,7 +7,9 @@ import 'package:provider/provider.dart';
 import '../game/mcpe_client.dart';
 import '../protocol/packets.dart';
 import '../state/session_controller.dart';
+import '../state/settings_store.dart';
 import '../widgets/mc_text.dart';
+import '../widgets/world_view.dart';
 
 class GameScreen extends StatefulWidget {
   const GameScreen({super.key});
@@ -20,6 +22,7 @@ class _GameScreenState extends State<GameScreen> {
   final _input = TextEditingController();
   final _focus = FocusNode();
   Timer? _overlayTimer;
+  bool _showChat = false;
 
   @override
   void initState() {
@@ -92,7 +95,7 @@ class _GameScreenState extends State<GameScreen> {
               ListTile(
                 leading: const Icon(Icons.person_outline),
                 title: McText(p.name),
-                subtitle: Text(_playerPosition(me, p)),
+                subtitle: Text(_playerPosition(me, c, p)),
               ),
             if (list.where((p) => p.name != c.nickname).isEmpty)
               const ListTile(title: Text('Сервер не сообщил о других игроках')),
@@ -102,8 +105,11 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
-  static String _playerPosition(Vec3? me, OnlinePlayer p) {
-    final pos = p.position;
+  static String _playerPosition(Vec3? me, McpeClient c, OnlinePlayer p) {
+    Vec3? pos;
+    for (final r in c.remotePlayers.values) {
+      if (r.uniqueId == p.uniqueId || r.name == p.name) pos = r.position;
+    }
     if (pos == null) return 'Далеко (вне зоны видимости)';
     if (me == null) return 'Координаты: $pos';
     final dx = pos.x - me.x, dy = pos.y - me.y, dz = pos.z - me.z;
@@ -164,7 +170,7 @@ class _GameScreenState extends State<GameScreen> {
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            McText(c.world?.worldName.isNotEmpty == true ? c.world!.worldName : session.address, maxLines: 1),
+            McText(c.startGame?.worldName.isNotEmpty == true ? c.startGame!.worldName : session.address, maxLines: 1),
             Text(_phaseText(c.phase), style: theme.textTheme.bodySmall),
           ],
         ),
@@ -178,6 +184,11 @@ class _GameScreenState extends State<GameScreen> {
             tooltip: 'Игроки',
           ),
           IconButton(onPressed: () => _showCommands(c), icon: const Icon(Icons.terminal), tooltip: 'Команды'),
+          IconButton(
+            onPressed: () => setState(() => _showChat = !_showChat),
+            icon: Icon(_showChat ? Icons.view_in_ar : Icons.chat),
+            tooltip: _showChat ? 'Мир' : 'Чат',
+          ),
           if (!disconnected)
             IconButton(onPressed: session.disconnect, icon: const Icon(Icons.logout), tooltip: 'Отключиться'),
         ],
@@ -185,11 +196,14 @@ class _GameScreenState extends State<GameScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            if (playing || c.phase == ConnectionPhase.spawning) _statusBar(c, theme),
+            if (_showChat && (playing || c.phase == ConnectionPhase.spawning)) _statusBar(c, theme),
             Expanded(
               child: Stack(
                 children: [
-                  _chat(c, theme),
+                  if (_showChat || !playing)
+                    _chat(c, theme)
+                  else
+                    WorldView(client: c, renderDistance: context.watch<SettingsStore>().renderDistance.toDouble()),
                   _overlays(c, theme),
                   if (c.dead && playing) _deathOverlay(c, theme),
                   if (disconnected) _disconnectedOverlay(session, c, theme),
@@ -197,7 +211,7 @@ class _GameScreenState extends State<GameScreen> {
                 ],
               ),
             ),
-            _inputBar(c, playing),
+            if (_showChat || !playing) _inputBar(c, playing),
           ],
         ),
       ),
