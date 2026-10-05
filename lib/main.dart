@@ -1,0 +1,35 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import 'screens/servers_screen.dart';
+import 'state/session_controller.dart';
+import 'state/settings_store.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => SettingsStore()..load()),
+        ChangeNotifierProvider(create: (_) => SessionController()),
+      ],
+      child: const McpeClientApp(),
+    ),
+  );
+}
+
+class McpeClientApp extends StatelessWidget {
+  const McpeClientApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    const seed = Color(0xFF4CAF50);
+    return MaterialApp(
+      title: 'MCPE 1.1.5 Client',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.light, useMaterial3: true),
+      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      home: const ServersScreen(),
+    );
+  }
+}
