@@ -1,0 +1,27 @@
+name: mcpe_client
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.5
+
+dependencies:
+  archive: ^4.3.0
+  audioplayers: ^6.8.1
+  file_picker: ^13.1.0
+  flutter:
+    sdk: flutter
+  image: ^4.10.1
+  path_provider: ^2.1.6
+  pointycastle: ^4.0.0
+  provider: ^6.1.5+1
+  shared_preferences: ^2.5.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
