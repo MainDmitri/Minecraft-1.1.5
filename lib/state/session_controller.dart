@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import '../game/mcpe_client.dart';
+import '../protocol/packets.dart';
 import '../protocol/raknet.dart';
 import '../protocol/skin.dart';
 import '../server/local_server.dart';
@@ -14,6 +15,9 @@ class SessionController extends ChangeNotifier {
   McpeClient? client;
   StreamSubscription<void>? _sub;
   String? error;
+
+  /// Версия сервера из ответа на запрос статуса (перед входом).
+  ServerStatus? serverStatus;
   bool connecting = false;
 
   LocalServer? server;
@@ -28,6 +32,16 @@ class SessionController extends ChangeNotifier {
   SkinData? _skin;
 
   String get address => '$_host:$_port';
+
+  /// Пояснение, если сервер работает не на MCPE 1.1.x: такой сервер не примет вход по протоколу 113.
+  String? get versionHint {
+    final st = serverStatus;
+    if (st == null || st.protocol == mcpeProtocol || st.protocol == 0) return null;
+    return 'Сервер работает на версии ${st.version} (протокол ${st.protocol}), а этот клиент — на MCPE '
+        '$mcpeVersion (протокол $mcpeProtocol). Такие версии несовместимы: сервер не понимает вход старого '
+        'клиента и отключает его (например, с сообщением «Login timeout»). Нужен сервер 1.1.x или сервер '
+        'с поддержкой старых версий.';
+  }
 
   bool get isHosting => server != null;
 
@@ -94,6 +108,14 @@ class SessionController extends ChangeNotifier {
       languageCode: Platform.localeName.split('.').first,
     );
     client = c;
+    serverStatus = null;
+    if (!isHosting) {
+      queryServer(_host, _port).then((st) {
+        if (!identical(client, c)) return;
+        serverStatus = st;
+        notifyListeners();
+      }, onError: (Object _) {});
+    }
     _sub = c.changes.listen((_) => _onClientChanged(c));
     notifyListeners();
     try {

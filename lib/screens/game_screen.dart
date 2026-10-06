@@ -391,6 +391,10 @@ class _GameScreenState extends State<GameScreen> {
               Text('Соединение закрыто', style: theme.textTheme.titleMedium),
               const SizedBox(height: 8),
               McText(session.error ?? c.disconnectReason ?? '', textAlign: TextAlign.center),
+              if (session.versionHint != null) ...[
+                const SizedBox(height: 8),
+                Text(session.versionHint!, textAlign: TextAlign.center, style: TextStyle(color: theme.colorScheme.error)),
+              ],
               const SizedBox(height: 12),
               Wrap(
                 spacing: 8,

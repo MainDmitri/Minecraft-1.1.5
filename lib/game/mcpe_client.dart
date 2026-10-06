@@ -195,6 +195,8 @@ class McpeClient {
     phase = ConnectionPhase.connecting;
     _notify();
     _spawned = Completer<void>();
+    // Ошибку ожидания появления в мире получает connect(); если вход сорвался раньше, её никто не ждёт.
+    _spawned!.future.ignore();
     final rak = RakNetClient(host: host, port: port);
     _rak = rak;
     rak.onPacket = _onRakPacket;
