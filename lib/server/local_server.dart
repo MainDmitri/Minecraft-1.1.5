@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import '../game/items.dart';
 import '../game/lang.dart';
 import '../protocol/binary.dart';
 import '../protocol/login.dart';
@@ -12,6 +13,7 @@ import '../world/blocks.dart';
 import '../world/world.dart';
 import 'generator.dart';
 import 'raknet_server.dart';
+import 'recipes.dart';
 import 'server_packets.dart';
 import 'world_storage.dart';
 
@@ -34,7 +36,18 @@ class _ServerPlayer {
   int gamemode = 0;
   bool flying = false;
   final List<ServerItem> inventory = List.generate(36, (_) => ServerItem.air);
+  final List<ServerItem> armor = List.generate(4, (_) => ServerItem.air);
   int heldIndex = 0;
+
+  /// Нажат верстак: разрешены рецепты 3×3.
+  bool craftingBig = false;
+
+  /// Открытое окно сундука или печи.
+  int? windowId;
+  _Container? window;
+
+  /// Незавершённая группа изменений слотов.
+  _Transaction? transaction;
 
   int chunkRadius = 4;
   final Set<int> sentChunks = {};
@@ -63,106 +76,154 @@ final List<List<int>> _creativeBlocks = [
   [162, 0], [162, 1], [165, 0], [170, 0], [172, 0], [173, 0], [174, 0], [179, 0],
 ];
 
-/// Время ломания голыми руками, секунды (упрощённо, без инструментов).
-double _breakSeconds(int id) {
-  switch (id) {
-    case 0:
-    case 31:
-    case 37:
-    case 38:
-    case 6:
-    case 50:
-    case 59:
-    case 83:
-    case 175:
-      return 0;
-    case 18:
-    case 161:
-      return 0.3;
-    case 20:
-    case 102:
-    case 89:
-      return 0.45;
-    case 2:
-    case 3:
-    case 12:
-    case 13:
-    case 60:
-    case 82:
-    case 88:
-    case 110:
-      return 0.9;
-    case 35:
-    case 24:
-    case 179:
-    case 80:
-    case 81:
-    case 86:
-    case 103:
-      return 1.2;
-    case 1:
-    case 98:
-    case 155:
-    case 159:
-    case 172:
-    case 48:
-      return 2.25;
-    case 4:
-    case 5:
-    case 17:
-    case 162:
-    case 45:
-    case 47:
-    case 58:
-    case 61:
-      return 3;
-    case 14:
-    case 15:
-    case 16:
-    case 21:
-    case 56:
-    case 73:
-    case 129:
-    case 153:
-      return 4.5;
-    case 41:
-    case 42:
-    case 57:
-    case 133:
-    case 152:
-    case 173:
-      return 6;
-    case 49:
-      return 10;
-    default:
-      return 1.5;
+/// Сундук или печь в мире.
+class _Container {
+  _Container(this.furnace, this.x, this.y, this.z) : items = List.generate(furnace ? 3 : 27, (_) => ServerItem.air);
+
+  final bool furnace;
+  final int x, y, z;
+  final List<ServerItem> items;
+  final Set<_ServerPlayer> viewers = {};
+
+  // Печь: оставшееся время горения, полное время текущего топлива, прогресс плавки (0..200).
+  int burn = 0, maxBurn = 0, cook = 0;
+
+  String get key => '$x,$y,$z';
+
+  Map<String, dynamic> toJson() => {
+        'type': furnace ? 'furnace' : 'chest',
+        'items': [for (final i in items) i.toJson()],
+        if (furnace) 'burn': [burn, maxBurn, cook],
+      };
+
+  static _Container fromJson(String key, Map<String, dynamic> j) {
+    final pos = key.split(',').map(int.parse).toList();
+    final c = _Container(j['type'] == 'furnace', pos[0], pos[1], pos[2]);
+    final items = (j['items'] as List).map((e) => (e as List).cast<int>()).toList();
+    for (var i = 0; i < c.items.length && i < items.length; i++) {
+      c.items[i] = ServerItem(items[i][0], items[i][1], items[i][2]);
+    }
+    final burn = (j['burn'] as List?)?.cast<int>();
+    if (burn != null && burn.length == 3) {
+      c
+        ..burn = burn[0]
+        ..maxBurn = burn[1]
+        ..cook = burn[2];
+    }
+    return c;
   }
 }
 
-/// Что выпадает при ломании в выживании.
-ServerItem? _drop(int id, int meta) {
+/// Предмет, лежащий в мире.
+class _ItemEntity {
+  _ItemEntity(this.id, this.item, this.x, this.y, this.z, this.vx, this.vy, this.vz, this.pickupDelay);
+
+  final int id;
+  ServerItem item;
+  double x, y, z, vx, vy, vz;
+  int pickupDelay;
+  int age = 0;
+  bool onGround = false;
+
+  int get chunkKeyValue => chunkKey(x.floor() >> 4, z.floor() >> 4);
+}
+
+/// Группа изменений слотов от клиента: применяется, когда предметы только переложены.
+class _Transaction {
+  final DateTime created = DateTime.now();
+
+  /// (окно, слот) → (было, стало).
+  final Map<(int, int), (ServerItem, ServerItem)> changes = {};
+
+  bool get balanced {
+    final total = <(int, int), int>{};
+    for (final (old, now) in changes.values) {
+      if (!old.isEmpty) total[(old.id, old.meta)] = (total[(old.id, old.meta)] ?? 0) + old.count;
+      if (!now.isEmpty) total[(now.id, now.meta)] = (total[(now.id, now.meta)] ?? 0) - now.count;
+    }
+    return total.values.every((v) => v == 0);
+  }
+}
+
+int _randomRange(math.Random rng, int min, int max) => min + rng.nextInt(max - min + 1);
+
+/// Что выпадает при ломании блока в выживании.
+List<ServerItem> _drops(int id, int meta, int toolId, math.Random rng) {
+  if (!canHarvest(id, toolId)) return const [];
+  final shears = toolId == 359;
+  ServerItem one(int i, [int m = 0, int n = 1]) => ServerItem(i, m, n);
   switch (id) {
+    case 1:
+      return [meta == 0 ? one(4) : one(1, meta)];
     case 2:
     case 60:
     case 110:
-      return ServerItem(3, 0, 1);
-    case 1:
-      return ServerItem(meta == 0 ? 4 : 1, meta, 1);
+      return [one(3)];
+    case 16:
+      return [one(263)];
+    case 56:
+      return [one(264)];
+    case 21:
+      return [one(351, 4, _randomRange(rng, 4, 8))];
+    case 73:
+    case 74:
+      return [one(331, 0, _randomRange(rng, 4, 5))];
+    case 129:
+      return [one(388)];
+    case 153:
+      return [one(406)];
+    case 89:
+      return [one(348, 0, _randomRange(rng, 2, 4))];
+    case 82:
+      return [one(337, 0, 4)];
+    case 80:
+      return [one(332, 0, 4)];
+    case 78:
+      return [one(332)];
+    case 47:
+      return [one(340, 0, 3)];
+    case 103:
+      return [one(360, 0, _randomRange(rng, 3, 7))];
+    case 13:
+      return [rng.nextInt(10) == 0 ? one(318) : one(13)];
     case 18:
     case 161:
+      if (shears) return [one(id, meta & 3)];
+      return [
+        if (rng.nextInt(20) == 0) one(6, id == 18 ? meta & 3 : 4 + (meta & 1)),
+        if (id == 18 && (meta & 3) == 0 && rng.nextInt(200) == 0) one(260),
+      ];
+    case 31:
+      if (shears) return [one(31, meta)];
+      return [if (rng.nextInt(8) == 0) one(295)];
+    case 17:
+    case 162:
+      return [one(id, meta & 3)];
+    case 62:
+      return [one(61)];
+    case 43:
+      return [one(44, meta & 7, 2)];
+    case 44:
+    case 158:
+      return [one(id, meta & 7)];
+    case 83:
+      return [one(338)];
     case 20:
     case 102:
     case 79:
-    case 31:
-    case 32:
-    case 51:
+    case 174:
     case 7:
-      return null;
-    case 17:
-    case 162:
-      return ServerItem(id, meta & 3, 1);
+    case 30:
+    case 51:
+    case 52:
+    case 26:
+    case 64:
+    case 71:
+    case 59:
+    case 92:
+      return const [];
     default:
-      return id > 0 && id < 256 ? ServerItem(id, meta, 1) : null;
+      return id > 0 && id < 256 ? [one(id, meta)] : const [];
   }
 }
 
@@ -188,7 +249,11 @@ class LocalServer {
   final Map<String, _ServerPlayer> _players = {};
   late Map<String, PlayerSave> _saves;
   int _nextEntityId = 1;
+  int _nextWindow = 1;
   int _tickCount = 0;
+  final math.Random _rng = math.Random();
+  final Map<String, _Container> _containers = {};
+  final Map<int, _ItemEntity> _items = {};
   Timer? _tick;
   int port = 0;
 
@@ -204,6 +269,11 @@ class LocalServer {
     meta = storage.readMeta();
     _gen = TerrainGenerator(meta.seed);
     _saves = storage.readPlayers();
+    try {
+      storage.readContainers().forEach((k, v) => _containers[k] = _Container.fromJson(k, v as Map<String, dynamic>));
+    } on FormatException {
+      _log.add('Не удалось прочитать containers.json');
+    }
     _rak = RakNetServer(
       motd: () => 'MCPE;${meta.name};$mcpeProtocol;$mcpeVersion;$onlineCount;$maxPlayers;0;${meta.name};'
           '${meta.gamemode == 1 ? 'Creative' : 'Survival'};1;$port;$port;',
@@ -272,6 +342,7 @@ class LocalServer {
     _modified.clear();
     storage.writeMeta(meta);
     storage.writePlayers(_saves);
+    storage.writeContainers({for (final c in _containers.values) c.key: c.toJson()});
   }
 
   void _savePlayer(_ServerPlayer p) {
@@ -285,6 +356,7 @@ class LocalServer {
       gamemode: p.gamemode,
       inventory: p.inventory.map((i) => i.toJson()).toList(),
       heldSlot: p.heldIndex,
+      armor: p.armor.map((i) => i.toJson()).toList(),
     );
   }
 
@@ -405,8 +477,8 @@ class LocalServer {
             ..breakY = y
             ..breakZ = z
             ..breakStart = DateTime.now();
-          final seconds = _breakSeconds(_blockId(x, y, z));
-          if (!p.creative && seconds > 0) {
+          final seconds = breakSeconds(_blockId(x, y, z), p.held.id);
+          if (!p.creative && seconds > 0 && seconds.isFinite) {
             _send(p, [spLevelEvent(LevelEventId.blockStartBreak, x.toDouble(), y.toDouble(), z.toDouble(), (65535 / (seconds * 20)).round())]);
           }
         } else if (action == PlayerActionType.abortBreak) {
@@ -431,6 +503,26 @@ class LocalServer {
           _send(p, [spContainerSetSlot(0, hotbar, p.inventory[hotbar])]);
         }
         _send(p, [spMobEquipment(p.entityId, p.held, hotbar + 9, hotbar)]);
+        break;
+      case PacketId.containerSetSlot:
+        final window = r.byte();
+        final slot = r.varint();
+        r.varint(); // слот хотбара
+        final item = readItem(r);
+        _onSetSlot(p, window, slot, ServerItem(item.id, item.meta, item.count));
+        break;
+      case PacketId.craftingEvent:
+        _onCrafting(p, r);
+        break;
+      case PacketId.dropItem:
+        r.byte();
+        readItem(r);
+        _onDrop(p);
+        break;
+      case PacketId.containerClose:
+        final window = r.byte();
+        if (window != 0) p.craftingBig = false;
+        if (window == p.windowId) _closeWindow(p, notify: false);
         break;
       case PacketId.adventureSettings:
         final flags = r.uvarint();
@@ -512,6 +604,10 @@ class LocalServer {
         final it = save.inventory[i];
         p.inventory[i] = ServerItem(it[0], it[1], it[2]);
       }
+      for (var i = 0; i < 4 && i < save.armor.length; i++) {
+        final it = save.armor[i];
+        p.armor[i] = ServerItem(it[0], it[1], it[2]);
+      }
     } else {
       p
         ..x = meta.spawnX + 0.5
@@ -539,6 +635,7 @@ class LocalServer {
       spUpdateAttributes(p.entityId, health: 20, food: 20, level: 0),
       spSetEntityData(p.entityId, entityMetadata(p.name)),
       _creativeContent(p),
+      spCraftingData(),
       spAvailableCommands(_commandsJson),
       spPlayerListAdd([for (final o in _online) _record(o)]),
     ]);
@@ -568,6 +665,7 @@ class LocalServer {
     _send(p, [
       spAdventureSettings(creative: p.creative, flying: p.flying, op: true),
       _inventoryContent(p),
+      spContainerSetContent(ContainerIds.armor, p.entityId, p.armor, const []),
       spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex),
       spSetTime(meta.time),
       spRespawn(p.x, p.y + _eyeHeight, p.z),
@@ -577,8 +675,8 @@ class LocalServer {
     _broadcast([joinMessage]);
     for (final o in _online) {
       if (o == p || !o.spawned) continue;
-      _send(p, [_addPlayer(o)]);
-      _send(o, [_addPlayer(p)]);
+      _send(p, [_addPlayer(o), spMobArmorEquipment(o.entityId, o.armor)]);
+      _send(o, [_addPlayer(p), spMobArmorEquipment(p.entityId, p.armor)]);
     }
   }
 
@@ -597,6 +695,7 @@ class LocalServer {
   void _onDisconnect(String key, String reason) {
     final p = _players.remove(key);
     if (p == null || !p.joined) return;
+    _closeWindow(p, notify: false);
     _savePlayer(p);
     storage.writePlayers(_saves);
     _broadcast([spRemoveEntity(p.entityId), spPlayerListRemove(p.uuid), spTranslation('§e%multiplayer.player.left', [p.name])]);
@@ -634,7 +733,11 @@ class LocalServer {
         final cx = key >> 32;
         final cz = (key << 32) >> 32;
         final data = _netCache.putIfAbsent(key, () => encodeChunkForNetwork(_chunk(cx, cz)));
-        _send(p, [spFullChunk(cx, cz, data)], level: 6);
+        _send(p, [
+          spFullChunk(cx, cz, data),
+          for (final e in _items.values)
+            if (e.chunkKeyValue == key) spAddItemEntity(e.id, e.item, e.x, e.y, e.z, e.vx, e.vy, e.vz),
+        ], level: 6);
         p.sentChunks.add(key);
         sent++;
         if (!p.spawned) {
@@ -650,6 +753,8 @@ class LocalServer {
     _tickCount++;
     meta.time++;
     _sendChunks(Stopwatch()..start());
+    _tickItems();
+    _tickFurnaces();
     if (_tickCount % 200 == 0) _broadcast([spSetTime(meta.time)]);
     if (_tickCount % 1200 == 0) {
       for (final p in _online) {
@@ -684,20 +789,33 @@ class LocalServer {
       _resendBlock(p, x, y, z);
       return;
     }
+    final meta = _blockMeta(x, y, z);
+    final tool = p.held;
     if (!p.creative) {
-      final seconds = _breakSeconds(id);
+      final seconds = breakSeconds(id, tool.id);
       final started = p.breakStart;
       final sameBlock = p.breakX == x && p.breakY == y && p.breakZ == z;
       final elapsed = started == null ? 0 : DateTime.now().difference(started).inMilliseconds;
-      if (id == 7 || (seconds > 0 && (!sameBlock || elapsed < seconds * 1000 * 0.75))) {
+      if (!seconds.isFinite || (seconds > 0 && (!sameBlock || elapsed < seconds * 1000 * 0.75))) {
         _resendBlock(p, x, y, z);
         return;
       }
-      final drop = _drop(id, _blockMeta(x, y, z));
-      if (drop != null) _give(p, drop);
+      for (final drop in _drops(id, meta, tool.id, _rng)) {
+        _spawnItem(drop, x + 0.5, y + 0.3, z + 0.5,
+            vx: (_rng.nextDouble() - 0.5) * 0.1, vy: 0.2, vz: (_rng.nextDouble() - 0.5) * 0.1);
+      }
+      _damageTool(p, id);
     }
     p.breakStart = null;
-    final meta = _blockMeta(x, y, z);
+    final container = _containers.remove('$x,$y,$z');
+    if (container != null) {
+      for (final viewer in container.viewers.toList()) {
+        _closeWindow(viewer);
+      }
+      for (final item in container.items) {
+        if (!item.isEmpty) _spawnItem(item, x + 0.5, y + 0.5, z + 0.5, vx: (_rng.nextDouble() - 0.5) * 0.2, vy: 0.2, vz: (_rng.nextDouble() - 0.5) * 0.2);
+      }
+    }
     _setBlock(x, y, z, 0, 0);
     // Остальные игроки рядом видят и слышат разрушение блока.
     final destroy = spLevelEvent(LevelEventId.particleDestroy, x + 0.5, y + 0.5, z + 0.5, id | (meta << 8));
@@ -707,14 +825,378 @@ class LocalServer {
     }
   }
 
-  void _give(_ServerPlayer p, ServerItem item) {
-    var slot = p.inventory.indexWhere((i) => i.id == item.id && i.meta == item.meta && i.count < 64);
-    if (slot < 0) slot = p.inventory.indexWhere((i) => i.isEmpty);
-    if (slot < 0) return;
-    final current = p.inventory[slot];
-    p.inventory[slot] = current.isEmpty ? item : (current..count += item.count);
-    _send(p, [spContainerSetSlot(0, slot, p.inventory[slot])]);
-    if (slot == p.heldIndex) _send(p, [spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex)]);
+  /// Износ инструмента после ломания блока.
+  void _damageTool(_ServerPlayer p, int blockId) {
+    final tool = p.held;
+    final info = toolInfo[tool.id];
+    if (info == null || blockRule(blockId).hardness == 0) return;
+    final damage = tool.meta + (info.type == ToolType.sword ? 2 : 1);
+    p.inventory[p.heldIndex] = damage >= info.durability ? ServerItem.air : ServerItem(tool.id, damage, 1);
+    _send(p, [
+      spContainerSetSlot(0, p.heldIndex, p.held),
+      spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex),
+    ]);
+  }
+
+  /// Положить предмет в инвентарь; возвращает, сколько не поместилось.
+  int _give(_ServerPlayer p, ServerItem item) {
+    var left = item.count;
+    final max = maxStackOf(item.id);
+    final changed = <int>{};
+    for (var pass = 0; pass < 2 && left > 0; pass++) {
+      for (var i = 0; i < 36 && left > 0; i++) {
+        final cur = p.inventory[i];
+        if (pass == 0 && !cur.isEmpty && cur.id == item.id && cur.meta == item.meta && cur.count < max) {
+          final add = math.min(left, max - cur.count);
+          cur.count += add;
+          left -= add;
+          changed.add(i);
+        } else if (pass == 1 && cur.isEmpty) {
+          final add = math.min(left, max);
+          p.inventory[i] = ServerItem(item.id, item.meta, add);
+          left -= add;
+          changed.add(i);
+        }
+      }
+    }
+    _send(p, [for (final i in changed) spContainerSetSlot(0, i, p.inventory[i])]);
+    if (changed.contains(p.heldIndex)) _send(p, [spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex)]);
+    return left;
+  }
+
+  // ---------- Предметы в мире ----------
+
+  void _spawnItem(ServerItem item, double x, double y, double z,
+      {double vx = 0, double vy = 0, double vz = 0, int delay = 10}) {
+    if (item.isEmpty) return;
+    final e = _ItemEntity(_nextEntityId++, ServerItem(item.id, item.meta, item.count), x, y, z, vx, vy, vz, delay);
+    _items[e.id] = e;
+    final packet = spAddItemEntity(e.id, e.item, x, y, z, vx, vy, vz);
+    for (final p in _online) {
+      if (p.spawned && p.sentChunks.contains(e.chunkKeyValue)) _send(p, [packet]);
+    }
+  }
+
+  bool _solidAt(double x, double y, double z) {
+    final id = _blockId(x.floor(), y.floor(), z.floor());
+    return id != 0 && blockTable[id].solid;
+  }
+
+  void _removeItem(_ItemEntity e) {
+    _items.remove(e.id);
+    final packet = spRemoveEntity(e.id);
+    for (final p in _online) {
+      if (p.sentChunks.contains(e.chunkKeyValue)) _send(p, [packet]);
+    }
+  }
+
+  void _tickItems() {
+    for (final e in _items.values.toList()) {
+      e.age++;
+      if (e.age > 6000 || e.y < -10) {
+        _removeItem(e);
+        continue;
+      }
+      if (e.pickupDelay > 0) e.pickupDelay--;
+      final ox = e.x, oy = e.y, oz = e.z;
+      if (!e.onGround || e.vx.abs() + e.vz.abs() > 0.001) {
+        e.vy -= 0.04;
+        final ny = e.y + e.vy;
+        if (e.vy < 0 && _solidAt(e.x, ny, e.z)) {
+          e
+            ..y = ny.floor() + 1.0
+            ..vy = 0
+            ..onGround = true;
+        } else {
+          e
+            ..y = ny
+            ..onGround = false;
+        }
+        final nx = e.x + e.vx, nz = e.z + e.vz;
+        if (!_solidAt(nx, e.y + 0.1, e.z)) {
+          e.x = nx;
+        } else {
+          e.vx = 0;
+        }
+        if (!_solidAt(e.x, e.y + 0.1, nz)) {
+          e.z = nz;
+        } else {
+          e.vz = 0;
+        }
+        final friction = e.onGround ? 0.5 : 0.98;
+        e
+          ..vx *= friction
+          ..vz *= friction;
+        // Предмет внутри блока выталкивается вверх.
+        if (_solidAt(e.x, e.y + 0.1, e.z)) {
+          e
+            ..y = e.y.floor() + 1.0
+            ..vy = 0;
+        }
+      } else if (!_solidAt(e.x, e.y - 0.05, e.z)) {
+        e.onGround = false;
+      }
+      if ((e.x - ox).abs() + (e.y - oy).abs() + (e.z - oz).abs() > 0.001) {
+        final packet = spMoveEntity(e.id, e.x, e.y, e.z, onGround: e.onGround);
+        for (final p in _online) {
+          if (p.sentChunks.contains(e.chunkKeyValue)) _send(p, [packet]);
+        }
+      }
+      if (e.pickupDelay > 0) continue;
+      for (final p in _online) {
+        if (!p.spawned) continue;
+        final dx = p.x - e.x, dz = p.z - e.z, dy = e.y - p.y;
+        if (dx * dx + dz * dz > 1.5 * 1.5 || dy < -1 || dy > 2) continue;
+        final left = _give(p, e.item);
+        if (left == e.item.count) continue;
+        final take = spTakeItemEntity(e.id, p.entityId);
+        for (final o in _online) {
+          if (o.sentChunks.contains(e.chunkKeyValue)) _send(o, [take]);
+        }
+        _removeItem(e);
+        if (left > 0) _spawnItem(ServerItem(e.item.id, e.item.meta, left), e.x, e.y, e.z, delay: 0);
+        break;
+      }
+    }
+  }
+
+  void _onDrop(_ServerPlayer p) {
+    final item = p.held;
+    if (!p.spawned || item.isEmpty) return;
+    p.inventory[p.heldIndex] = ServerItem.air;
+    _send(p, [spContainerSetSlot(0, p.heldIndex, p.held), spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex)]);
+    final yaw = p.yaw * math.pi / 180, pitch = p.pitch * math.pi / 180;
+    final dx = -math.sin(yaw) * math.cos(pitch), dz = math.cos(yaw) * math.cos(pitch), dy = -math.sin(pitch);
+    _spawnItem(item, p.x, p.y + 1.3, p.z, vx: dx * 0.3, vy: dy * 0.3 + 0.1, vz: dz * 0.3, delay: 40);
+  }
+
+  // ---------- Инвентарь, крафт, окна ----------
+
+  List<ServerItem>? _slotsOf(_ServerPlayer p, int window) {
+    if (window == ContainerIds.inventory) return p.inventory;
+    if (window == ContainerIds.armor) return p.armor;
+    if (window == p.windowId) return p.window?.items;
+    return null;
+  }
+
+  void _resync(_ServerPlayer p) {
+    p.transaction = null;
+    _send(p, [
+      _inventoryContent(p),
+      spContainerSetContent(ContainerIds.armor, p.entityId, p.armor, const []),
+      spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex),
+      if (p.window != null && p.windowId != null) spContainerSetContent(p.windowId!, p.entityId, p.window!.items, const []),
+    ]);
+  }
+
+  void _onSetSlot(_ServerPlayer p, int window, int slot, ServerItem item) {
+    final list = _slotsOf(p, window);
+    if (!p.spawned || list == null || slot < 0 || slot >= (window == ContainerIds.inventory ? 36 : list.length)) return;
+    final current = list[slot];
+    if (current.id == item.id && current.meta == item.meta && current.count == item.count) return;
+    if (item.count > maxStackOf(item.id) ||
+        (window == ContainerIds.armor && !item.isEmpty && armorSlotOf(item.id) != slot)) {
+      _resync(p);
+      return;
+    }
+    if (p.creative && window == ContainerIds.inventory) {
+      // В творчестве предметы берутся из творческого инвентаря без баланса.
+      list[slot] = item.isEmpty ? ServerItem.air : item;
+      if (slot == p.heldIndex) _send(p, [spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex)]);
+      return;
+    }
+    var tx = p.transaction;
+    if (tx == null || DateTime.now().difference(tx.created) > const Duration(seconds: 8)) {
+      if (tx != null) _resync(p);
+      tx = p.transaction = _Transaction();
+    }
+    final key = (window, slot);
+    final old = tx.changes[key]?.$1 ?? current;
+    tx.changes[key] = (old, item);
+    if (!tx.balanced) return;
+    p.transaction = null;
+    var armorChanged = false;
+    final touched = <_Container>{};
+    for (final e in tx.changes.entries) {
+      final target = _slotsOf(p, e.key.$1);
+      if (target == null) continue;
+      final now = e.value.$2;
+      target[e.key.$2] = now.isEmpty ? ServerItem.air : ServerItem(now.id, now.meta, now.count);
+      if (e.key.$1 == ContainerIds.armor) armorChanged = true;
+      if (e.key.$1 == p.windowId && p.window != null) touched.add(p.window!);
+    }
+    _send(p, [spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex)]);
+    if (armorChanged) _broadcast([spMobArmorEquipment(p.entityId, p.armor)], except: p);
+    for (final c in touched) {
+      for (final viewer in c.viewers) {
+        if (viewer == p || viewer.windowId == null) continue;
+        _send(viewer, [spContainerSetContent(viewer.windowId!, viewer.entityId, c.items, const [])]);
+      }
+    }
+  }
+
+  void _onCrafting(_ServerPlayer p, BinaryReader r) {
+    r.byte(); // окно
+    r.varint(); // тип
+    final uuid = r.bytes(16);
+    final input = [for (var n = r.uvarint(), i = 0; i < n && i < 128; i++) readItem(r)];
+    final output = [for (var n = r.uvarint(), i = 0; i < n && i < 128; i++) readItem(r)];
+    final recipe = recipeByUuid(uuid);
+    if (!p.spawned || recipe == null || output.isEmpty || (recipe.big && !p.craftingBig) || input.length < 9) {
+      _resync(p);
+      return;
+    }
+    final items = [for (var i = 0; i < 9; i++) input[i].isEmpty ? null : input[i]];
+    var ok = true;
+    if (!recipe.shapeless) {
+      for (var y = 0; y < 3 && ok; y++) {
+        for (var x = 0; x < 3; x++) {
+          final ing = recipe.at(x, y);
+          final item = items[y * 3 + x];
+          if ((ing == null) != (item == null) || (ing != null && !ingredientMatches(ing, item!.id, item.meta))) {
+            ok = false;
+            break;
+          }
+        }
+      }
+    } else {
+      final needed = [...recipe.cells];
+      for (final item in items.whereType<ItemStack>()) {
+        final k = needed.indexWhere((n) => n != null && ingredientMatches(n, item.id, item.meta));
+        if (k < 0) {
+          ok = false;
+          break;
+        }
+        needed.removeAt(k);
+      }
+      if (needed.isNotEmpty) ok = false;
+    }
+    final out = output.first;
+    if (!ok || out.id != recipe.result.id || out.meta != recipe.result.meta || out.count != recipe.result.count) {
+      _resync(p);
+      return;
+    }
+    // Ингредиенты забираются из инвентаря.
+    final used = List<int>.filled(36, 0);
+    for (final item in items.whereType<ItemStack>()) {
+      var found = false;
+      for (var i = 0; i < 36; i++) {
+        final inv = p.inventory[i];
+        if (!inv.isEmpty && inv.id == item.id && inv.meta == item.meta && inv.count - used[i] >= 1) {
+          used[i]++;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        _resync(p);
+        return;
+      }
+    }
+    final changed = <Uint8List>[];
+    for (var i = 0; i < 36; i++) {
+      if (used[i] == 0) continue;
+      final inv = p.inventory[i];
+      p.inventory[i] = inv.count > used[i] ? ServerItem(inv.id, inv.meta, inv.count - used[i]) : ServerItem.air;
+      changed.add(spContainerSetSlot(0, i, p.inventory[i]));
+    }
+    _send(p, changed);
+    final left = _give(p, recipe.result);
+    if (left > 0) _spawnItem(ServerItem(recipe.result.id, recipe.result.meta, left), p.x, p.y + 1.3, p.z, delay: 40);
+    _send(p, [spMobEquipment(p.entityId, p.held, p.heldIndex + 9, p.heldIndex)]);
+  }
+
+  void _openWindow(_ServerPlayer p, _Container c) {
+    _closeWindow(p);
+    final id = _nextWindow;
+    _nextWindow = _nextWindow >= 99 ? 1 : _nextWindow + 1;
+    p
+      ..windowId = id
+      ..window = c;
+    c.viewers.add(p);
+    _send(p, [
+      spContainerOpen(id, c.furnace ? WindowType.furnace : WindowType.container, c.x, c.y, c.z, p.entityId),
+      spContainerSetContent(id, p.entityId, c.items, const []),
+      if (c.furnace) ...[
+        spContainerSetData(id, 0, c.cook),
+        spContainerSetData(id, 1, c.burn),
+        spContainerSetData(id, 2, c.maxBurn),
+      ],
+    ]);
+  }
+
+  void _closeWindow(_ServerPlayer p, {bool notify = true}) {
+    final id = p.windowId;
+    p.window?.viewers.remove(p);
+    p
+      ..window = null
+      ..windowId = null
+      ..transaction = null;
+    if (id != null && notify) _send(p, [spContainerClose(id)]);
+  }
+
+  void _tickFurnaces() {
+    for (final c in _containers.values) {
+      if (!c.furnace) continue;
+      final input = c.items[0], fuel = c.items[1], out = c.items[2];
+      final result = input.isEmpty ? null : smeltResult(input.id, input.meta);
+      final canSmelt = result != null &&
+          (out.isEmpty || (out.id == result.id && out.meta == result.meta && out.count + result.count <= maxStackOf(out.id)));
+      final wasBurning = c.burn > 0;
+      var slotsChanged = false;
+      if (c.burn > 0) c.burn--;
+      if (c.burn == 0 && canSmelt && !fuel.isEmpty) {
+        final ticks = fuelTicks(fuel.id, fuel.meta);
+        if (ticks > 0) {
+          c
+            ..burn = ticks
+            ..maxBurn = ticks;
+          if (fuel.id == 325) {
+            c.items[1] = ServerItem(325, 0, 1);
+          } else {
+            c.items[1] = fuel.count > 1 ? ServerItem(fuel.id, fuel.meta, fuel.count - 1) : ServerItem.air;
+          }
+          slotsChanged = true;
+        }
+      }
+      if (c.burn > 0 && canSmelt) {
+        c.cook++;
+        if (c.cook >= 200) {
+          c.cook = 0;
+          c.items[0] = input.count > 1 ? ServerItem(input.id, input.meta, input.count - 1) : ServerItem.air;
+          c.items[2] = out.isEmpty ? ServerItem(result.id, result.meta, result.count) : ServerItem(out.id, out.meta, out.count + result.count);
+          slotsChanged = true;
+        }
+      } else if (c.cook > 0) {
+        c.cook = math.max(0, c.cook - 2);
+      }
+      final burning = c.burn > 0;
+      if (burning != wasBurning) {
+        final id = _blockId(c.x, c.y, c.z);
+        if (id == 61 || id == 62) _setBlock(c.x, c.y, c.z, burning ? 62 : 61, _blockMeta(c.x, c.y, c.z));
+      }
+      for (final v in c.viewers) {
+        final w = v.windowId;
+        if (w == null) continue;
+        _send(v, [
+          if (slotsChanged) spContainerSetContent(w, v.entityId, c.items, const []),
+          if (slotsChanged || _tickCount % 5 == 0) ...[
+            spContainerSetData(w, 0, c.cook),
+            spContainerSetData(w, 1, c.burn),
+            spContainerSetData(w, 2, c.maxBurn),
+          ],
+        ]);
+      }
+    }
+  }
+
+  /// Направление «лицом к игроку» для печи и сундука (мета 2..5).
+  int _facingMeta(_ServerPlayer p) {
+    final yaw = ((p.yaw % 360) + 360) % 360;
+    if (yaw >= 45 && yaw < 135) return 5;
+    if (yaw >= 135 && yaw < 225) return 3;
+    if (yaw >= 225 && yaw < 315) return 4;
+    return 2;
   }
 
   void _onUseItem(_ServerPlayer p, BinaryReader r) {
@@ -722,6 +1204,18 @@ class LocalServer {
     r.uvarint(); // блок, по которому кликнули
     final face = r.varint();
     if (!p.spawned || face < 0 || face > 5) return;
+    // Блоки, которые открываются нажатием: верстак, сундук, печь.
+    final target = _blockId(x, y, z);
+    if (_inReach(p, x, y, z)) {
+      if (target == 58) {
+        p.craftingBig = true;
+        return;
+      }
+      if (target == 54 || target == 61 || target == 62) {
+        _openWindow(p, _containers.putIfAbsent('$x,$y,$z', () => _Container(target != 54, x, y, z)));
+        return;
+      }
+    }
     final (tx, ty, tz) = switch (face) {
       0 => (x, y - 1, z),
       1 => (x, y + 1, z),
@@ -738,7 +1232,9 @@ class LocalServer {
       _resendBlock(p, tx, ty, tz);
       return;
     }
-    _setBlock(tx, ty, tz, held.id, held.meta);
+    final facing = held.id == 54 || held.id == 61;
+    _setBlock(tx, ty, tz, held.id, facing ? _facingMeta(p) : held.meta);
+    if (facing) _containers['$tx,$ty,$tz'] = _Container(held.id == 61, tx, ty, tz);
     if (!p.creative) {
       held.count--;
       if (held.count <= 0) p.inventory[p.heldIndex] = ServerItem.air;
@@ -812,6 +1308,16 @@ class LocalServer {
       }
     ),
     'setworldspawn': ('Сделать текущую позицию точкой появления', {'default': []}),
+    'give': (
+      'Выдать предмет: /give <ID> [количество] [мета]',
+      {
+        'default': [
+          {'name': 'item', 'type': 'int', 'optional': false},
+          {'name': 'amount', 'type': 'int', 'optional': true},
+          {'name': 'data', 'type': 'int', 'optional': true},
+        ],
+      }
+    ),
   };
 
   /// Аргументы из JSON CommandStepPacket в порядке параметров.
@@ -914,6 +1420,18 @@ class LocalServer {
           ..spawnZ = p.z.floor();
         storage.writeMeta(meta);
         _message(p, 'Точка появления: ${meta.spawnX} ${meta.spawnY} ${meta.spawnZ}');
+        break;
+      case 'give':
+        final id = args.isEmpty ? null : int.tryParse(args[0]);
+        final amount = args.length > 1 ? int.tryParse(args[1]) ?? 1 : 1;
+        final data = args.length > 2 ? int.tryParse(args[2]) ?? 0 : 0;
+        if (id == null || id <= 0 || id > 511 || amount < 1 || amount > 640) {
+          _message(p, '§cИспользование: /give <ID> [количество] [мета]');
+          return;
+        }
+        final left = _give(p, ServerItem(id, data, amount));
+        if (left > 0) _spawnItem(ServerItem(id, data, left), p.x, p.y + 1.3, p.z, delay: 40);
+        _message(p, 'Выдано: ${itemTitle(id, data)} ×$amount');
         break;
       default:
         _message(p, '§c${translate('commands.generic.unknown', const [])}');

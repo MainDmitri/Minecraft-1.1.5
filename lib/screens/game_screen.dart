@@ -11,6 +11,7 @@ import '../state/session_controller.dart';
 import '../state/settings_store.dart';
 import '../state/texture_store.dart';
 import '../textures/texture_pack.dart';
+import '../widgets/inventory_view.dart';
 import '../widgets/mc_text.dart';
 import '../widgets/mc_ui.dart';
 import '../widgets/world_view.dart';
@@ -27,6 +28,12 @@ class _GameScreenState extends State<GameScreen> {
   final GlobalKey<WorldViewState> _worldKey = GlobalKey();
   Timer? _overlayTimer;
   bool _paused = false;
+  bool _inventory = false;
+
+  void _closeInventory(McpeClient c) {
+    c.closeContainer();
+    setState(() => _inventory = false);
+  }
 
   @override
   void initState() {
@@ -201,7 +208,13 @@ class _GameScreenState extends State<GameScreen> {
     return PopScope(
       canPop: !playing,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) setState(() => _paused = !_paused);
+        if (didPop) return;
+        final client = context.read<SessionController>().client;
+        if (client != null && (_inventory || client.container != null)) {
+          _closeInventory(client);
+          return;
+        }
+        setState(() => _paused = !_paused);
       },
       child: Scaffold(
         backgroundColor: Colors.black,
@@ -217,9 +230,20 @@ class _GameScreenState extends State<GameScreen> {
                 pack: pack,
                 sounds: context.watch<TextureStore>().sounds,
                 onPause: () => setState(() => _paused = true),
+                onInventory: () => setState(() => _inventory = true),
               ),
             if (c != null && playing) _overlays(c),
             if (c != null && playing && c.dead) _deathScreen(c, pack),
+            // Сундук или печь сервер открывает сам — окно появляется по событию клиента.
+            if (c != null && playing && !c.dead && !_paused)
+              Positioned.fill(
+                child: StreamBuilder<void>(
+                  stream: c.changes,
+                  builder: (context, _) => _inventory || c.container != null
+                      ? InventoryView(client: c, pack: pack, skin: settings.skin, onClose: () => _closeInventory(c))
+                      : const SizedBox.shrink(),
+                ),
+              ),
             if (c != null && playing && _paused && !c.dead) _pauseMenu(session, c, pack, settings),
             if (c == null || (!playing && !disconnected)) _loadingScreen(c, pack),
             if (disconnected) _disconnectedScreen(session, c, pack),

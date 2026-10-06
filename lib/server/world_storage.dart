@@ -150,6 +150,7 @@ class PlayerSave {
     required this.gamemode,
     required this.inventory,
     required this.heldSlot,
+    this.armor = const [],
   });
 
   final double x, y, z, yaw, pitch;
@@ -159,12 +160,16 @@ class PlayerSave {
   final List<List<int>> inventory;
   final int heldSlot;
 
+  /// 4 слота брони: [id, meta, count].
+  final List<List<int>> armor;
+
   Map<String, dynamic> toJson() => {
         'pos': [x, y, z],
         'rot': [yaw, pitch],
         'gamemode': gamemode,
         'inventory': inventory,
         'held': heldSlot,
+        'armor': armor,
       };
 
   static PlayerSave fromJson(Map<String, dynamic> j) {
@@ -179,6 +184,7 @@ class PlayerSave {
       gamemode: j['gamemode'] as int,
       inventory: (j['inventory'] as List).map((e) => (e as List).cast<int>()).toList(),
       heldSlot: j['held'] as int,
+      armor: ((j['armor'] as List?) ?? const []).map((e) => (e as List).cast<int>()).toList(),
     );
   }
 }
@@ -191,6 +197,7 @@ class WorldStorage {
 
   File get _metaFile => File('${dir.path}/world.json');
   File get _playersFile => File('${dir.path}/players.json');
+  File get _containersFile => File('${dir.path}/containers.json');
   Directory get _chunksDir => Directory('${dir.path}/chunks');
 
   WorldMeta readMeta() => WorldMeta.fromJson(jsonDecode(_metaFile.readAsStringSync()) as Map<String, dynamic>);
@@ -208,6 +215,17 @@ class WorldStorage {
 
   void writePlayers(Map<String, PlayerSave> players) {
     _playersFile.writeAsStringSync(jsonEncode(players.map((k, v) => MapEntry(k, v.toJson()))));
+  }
+
+  /// Сундуки и печи: "x,y,z" → данные контейнера.
+  Map<String, dynamic> readContainers() {
+    if (!_containersFile.existsSync()) return {};
+    return jsonDecode(_containersFile.readAsStringSync()) as Map<String, dynamic>;
+  }
+
+  void writeContainers(Map<String, dynamic> containers) {
+    dir.createSync(recursive: true);
+    _containersFile.writeAsStringSync(jsonEncode(containers));
   }
 
   File _chunkFile(int cx, int cz) => File('${_chunksDir.path}/$cx.$cz.bin');

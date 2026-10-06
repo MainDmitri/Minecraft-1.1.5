@@ -100,6 +100,8 @@ class SoundManager {
         play(_resolve('step_', material), volume: sound.volume);
       case SoundKind.hurt:
         play('random_hurt', volume: sound.volume);
+      case SoundKind.pickup:
+        play('random_pop', volume: sound.volume);
     }
   }
 

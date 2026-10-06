@@ -56,7 +56,7 @@ void main() {
     expect(a.level.blockId(target.x, target.y, target.z), 45);
     expect(b.level.blockId(target.x, target.y, target.z), 45);
 
-    // Bob в выживании ломает блок под собой и получает предмет.
+    // Bob в выживании ломает блок под собой; предмет выпадает и его подбирает кто-то из стоящих рядом.
     b.sendMessage('/gamemode 0');
     await pause(500);
     b.player.pitch = 89;
@@ -66,7 +66,8 @@ void main() {
     b.setBreaking(false);
     await pause(500);
     expect(a.level.blockId(under.x, under.y, under.z), 0);
-    expect(b.hotbarItem(0).isEmpty, isFalse);
+    final picked = [...a.inventory, ...b.inventory].where((i) => i.id == 3);
+    expect(picked, isNotEmpty);
 
     b.dispose();
     a.dispose();

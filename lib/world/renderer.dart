@@ -4,7 +4,9 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/painting.dart';
 
+import '../protocol/packets.dart';
 import '../textures/texture_pack.dart';
+import 'blocks.dart';
 import 'mesher.dart';
 import 'world.dart';
 
@@ -35,6 +37,14 @@ class BreakOverlay {
   final BlockPos pos;
   final int stage;
   final int faceMask;
+}
+
+/// Предмет на земле: позиция и сам предмет.
+class DroppedItem {
+  DroppedItem(this.x, this.y, this.z, this.item);
+
+  final double x, y, z;
+  final ItemStack item;
 }
 
 class BlockPos {
@@ -143,8 +153,55 @@ class WorldRenderer {
     _col = Int32List(size ~/ 2)..setRange(0, _col.length, _col);
   }
 
-  SectionMesh _entityMesh(List<EntityBox> entities) {
+  void _addDropped(MeshBuilder b, DroppedItem d, Camera cam, double time) {
+    final pack = _pack;
+    final item = d.item;
+    final bob = math.sin(time * 2 + d.x + d.z) * 0.05;
+    final cy = d.y + 0.2 + bob;
+    final isCube = item.id < 256 && blockTable[item.id].shape == BlockShape.cube;
+    final itemTile = pack == null || item.id < 256 ? -1 : pack.itemTile(item.id, item.meta);
+    if (isCube || (pack == null && item.id < 256)) {
+      // Блок — маленький вращающийся куб.
+      const h = 0.125;
+      final a = time * 1.2 + d.x * 3;
+      final ca = math.cos(a) * h, sa = math.sin(a) * h;
+      List<double> p(double lx, double ly, double lz) => [d.x + lx * ca - lz * sa, cy + ly * h, d.z + lx * sa + lz * ca];
+      final faces = [
+        [p(-1, -1, -1), p(-1, 1, -1), p(-1, 1, 1), p(-1, -1, 1)],
+        [p(1, -1, -1), p(1, -1, 1), p(1, 1, 1), p(1, 1, -1)],
+        [p(-1, -1, -1), p(-1, -1, 1), p(1, -1, 1), p(1, -1, -1)],
+        [p(-1, 1, -1), p(1, 1, -1), p(1, 1, 1), p(-1, 1, 1)],
+        [p(-1, -1, -1), p(1, -1, -1), p(1, 1, -1), p(-1, 1, -1)],
+        [p(-1, -1, 1), p(-1, 1, 1), p(1, 1, 1), p(1, -1, 1)],
+      ];
+      const shade = [0xFFB8B8B8, 0xFFB8B8B8, 0xFF808080, 0xFFFFFFFF, 0xFFDBDBDB, 0xFFDBDBDB];
+      const uv = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0];
+      for (var f = 0; f < 6; f++) {
+        final tile = pack?.tile(item.id, item.meta, f) ?? -1;
+        final color = pack == null ? (blockColor(item.id, item.meta) | 0xFF000000) : shade[f];
+        b.face([for (final v in faces[f]) ...v], color, faceCross, uv: uv, tile: tile < 0 ? 0 : tile);
+      }
+      return;
+    }
+    // Предмет — плоская иконка, повёрнутая к камере.
+    final yaw = cam.yaw * math.pi / 180;
+    final rx = -math.cos(yaw) * 0.2, rz = -math.sin(yaw) * 0.2;
+    const hh = 0.2;
+    final tile = itemTile >= 0 ? itemTile : (pack?.tile(item.id, item.meta, 0) ?? 0);
+    b.face([
+      d.x - rx, cy - hh, d.z - rz, //
+      d.x + rx, cy - hh, d.z + rz,
+      d.x + rx, cy + hh, d.z + rz,
+      d.x - rx, cy + hh, d.z - rz,
+    ], pack == null ? 0xFFDDDDDD : 0xFFFFFFFF, faceCross, uv: const [0, 1, 1, 1, 1, 0, 0, 0], tile: tile < 0 ? 0 : tile);
+  }
+
+  SectionMesh _entityMesh(List<EntityBox> entities, List<DroppedItem> dropped, Camera cam) {
     final b = MeshBuilder(_pack);
+    final time = DateTime.now().millisecondsSinceEpoch % 1000000 / 1000.0;
+    for (final d in dropped) {
+      _addDropped(b, d, cam, time);
+    }
     for (final e in entities) {
       final x0 = e.x - 0.3, x1 = e.x + 0.3, y0 = e.y, y1 = e.y + 1.8, z0 = e.z - 0.3, z1 = e.z + 0.3;
       const body = 0xFF2E8BC0, head = 0xFFC58F6B;
@@ -166,6 +223,7 @@ class WorldRenderer {
     required double renderDistance,
     required int skyColor,
     List<EntityBox> entities = const [],
+    List<DroppedItem> dropped = const [],
     BlockPos? target,
     BreakOverlay? breaking,
     int? worldTime,
@@ -211,7 +269,7 @@ class WorldRenderer {
       if (cy.abs() - ky > cz * tanY) continue;
       meshes.add(m);
     }
-    if (entities.isNotEmpty) meshes.add(_entityMesh(entities));
+    if (entities.isNotEmpty || dropped.isNotEmpty) meshes.add(_entityMesh(entities, dropped, cam));
 
     // Отбор граней.
     var n = 0;

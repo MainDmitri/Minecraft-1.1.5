@@ -15,13 +15,51 @@ import '../world/player.dart';
 import '../world/renderer.dart';
 import '../world/world.dart';
 import 'commands.dart';
+import 'crafting.dart';
+import 'items.dart';
 import 'lang.dart';
 
 enum ConnectionPhase { idle, connecting, loggingIn, spawning, playing, disconnected }
 
 enum ChatKind { chat, system, local, error }
 
-enum SoundKind { breakBlock, placeBlock, step, hit, hurt }
+enum SoundKind { breakBlock, placeBlock, step, hit, hurt, pickup }
+
+/// Слот: окно (0 — инвентарь, 0x78 — броня или ID открытого контейнера) и номер.
+class SlotRef {
+  const SlotRef(this.window, this.index);
+
+  final int window;
+  final int index;
+
+  @override
+  bool operator ==(Object other) => other is SlotRef && other.window == window && other.index == index;
+
+  @override
+  int get hashCode => Object.hash(window, index);
+}
+
+/// Открытое окно: сундук, печь (от сервера) или верстак (открывается клиентом, ID −1).
+class OpenContainer {
+  OpenContainer(this.windowId, this.type, this.pos, int size) : slots = List.filled(size, ItemStack.empty, growable: true);
+
+  final int windowId;
+  final int type;
+  final BlockPos? pos;
+  List<ItemStack> slots;
+
+  /// Свойства окна (печь: 0 — прогресс плавки, 1 — остаток топлива, 2 — полное время топлива).
+  final Map<int, int> data = {};
+}
+
+/// Предмет, лежащий в мире.
+class ItemEntity {
+  ItemEntity(this.uniqueId, this.item, this.position);
+
+  final int uniqueId;
+  final ItemStack item;
+  Vec3 position;
+}
 
 /// Игровой звук: вид, блок (его материал определяет звук) и громкость 0..1.
 class GameSound {
@@ -153,6 +191,17 @@ class McpeClient {
   List<ItemStack> creativeItems = [];
   int selectedHotbar = 0;
   ItemStack heldItem = ItemStack.empty;
+  List<ItemStack> armor = List.filled(4, ItemStack.empty);
+
+  /// Рецепты, присланные сервером.
+  List<CraftingRecipe> recipes = [];
+  List<FurnaceRecipe> furnaceRecipes = [];
+
+  /// Открытое окно (сундук, печь, верстак) или null.
+  OpenContainer? container;
+
+  /// Предметы на земле по runtime ID.
+  final Map<int, ItemEntity> itemEntities = {};
 
   // Ломание блока.
   bool _breakHeld = false;
@@ -368,6 +417,62 @@ class McpeClient {
       case PacketId.removeEntity:
         final uniqueId = r.varint();
         remotePlayers.removeWhere((_, p) => p.uniqueId == uniqueId);
+        itemEntities.removeWhere((_, e) => e.uniqueId == uniqueId);
+        _notify();
+        break;
+      case PacketId.addItemEntity:
+        final uniqueId = r.varint();
+        final runtimeId = r.uvarint();
+        final item = readItem(r);
+        itemEntities[runtimeId] = ItemEntity(uniqueId, item, Vec3.read(r));
+        break;
+      case PacketId.moveEntity:
+        final runtimeId = r.uvarint();
+        final entity = itemEntities[runtimeId];
+        if (entity != null) entity.position = Vec3.read(r);
+        break;
+      case PacketId.takeItemEntity:
+        final target = r.uvarint();
+        final taker = r.uvarint();
+        final taken = itemEntities.remove(target);
+        if (taken != null && taker == _runtimeId) _sound(SoundKind.pickup, 0, 0.5);
+        break;
+      case PacketId.mobArmorEquipment:
+        final runtimeId = r.uvarint();
+        final slots = [for (var i = 0; i < 4; i++) readItem(r)];
+        if (runtimeId == _runtimeId) {
+          armor = slots;
+          _notify();
+        }
+        break;
+      case PacketId.containerOpen:
+        final window = r.byte();
+        final type = r.byte();
+        final x = r.varint(), y = r.uvarint(), z = r.varint();
+        container = OpenContainer(window, type, BlockPos(x, y, z), type == WindowType.furnace ? 3 : 27);
+        _notify();
+        break;
+      case PacketId.containerClose:
+        final window = r.byte();
+        if (container?.windowId == window) {
+          container = null;
+          _notify();
+        }
+        break;
+      case PacketId.containerSetData:
+        final window = r.byte();
+        final property = r.varint();
+        final value = r.varint();
+        final c = container;
+        if (c != null && c.windowId == window) {
+          c.data[property] = value;
+          _notify();
+        }
+        break;
+      case PacketId.craftingData:
+        final data = readCraftingData(r);
+        recipes = data.recipes;
+        furnaceRecipes = data.furnace;
         _notify();
         break;
       case PacketId.movePlayer:
@@ -415,11 +520,8 @@ class McpeClient {
         final slot = r.varint();
         r.varint(); // слот хотбара
         final item = readItem(r);
-        if (window == 0 && slot >= 0) {
-          if (slot >= inventory.length) {
-            inventory = [...inventory, ...List.filled(slot + 1 - inventory.length, ItemStack.empty)];
-          }
-          inventory[slot] = item;
+        if (slot >= 0 && _putSlot(SlotRef(window, slot), item)) {
+          _refreshHeld();
           _notify();
         }
         break;
@@ -491,12 +593,17 @@ class McpeClient {
     for (var i = 0; i < hotbarCount; i++) {
       hotbar.add(r.varint());
     }
-    if (window == 0) {
-      inventory = items;
+    if (window == ContainerIds.inventory) {
+      inventory = [...items, for (var i = items.length; i < 36; i++) ItemStack.empty];
       if (hotbar.isNotEmpty) {
         hotbarLinks = List.generate(9, (i) => i < hotbar.length ? hotbar[i] : -1);
       }
-    } else if (window == 0x79) {
+      _refreshHeld();
+    } else if (window == ContainerIds.armor) {
+      armor = [for (var i = 0; i < 4; i++) i < items.length ? items[i] : ItemStack.empty];
+    } else if (container?.windowId == window) {
+      container!.slots = items;
+    } else if (window == ContainerIds.creative) {
       creativeItems = items.where((i) => !i.isEmpty).toList();
     }
     _notify();
@@ -859,9 +966,12 @@ class McpeClient {
     if (hit == null) return;
     final item = heldItem;
     if (!item.isEmpty && item.id < 256 && blockTable[item.id].solid && player.intersects(hit.adjacent)) return;
-    _placeAt = hit.adjacent;
-    _placeAgainst = hit.block;
-    _placeTime = DateTime.now();
+    final target = level.blockId(hit.block.x, hit.block.y, hit.block.z);
+    if (target != 58) {
+      _placeAt = hit.adjacent;
+      _placeAgainst = hit.block;
+      _placeTime = DateTime.now();
+    }
     _sendPacket(buildUseItem(
       x: hit.block.x,
       y: hit.block.y,
@@ -875,6 +985,11 @@ class McpeClient {
       hotbarSlot: selectedHotbar,
       item: item,
     ));
+    // Верстак в 1.1 открывается самим клиентом; сервер после нажатия разрешает крафт 3×3.
+    if (target == 58) {
+      container = OpenContainer(-1, WindowType.workbench, hit.block, 0);
+      _notify();
+    }
   }
 
   void selectHotbar(int index) {
@@ -905,6 +1020,106 @@ class McpeClient {
     _sendPacket(buildAdventureSettings(flags, _permission));
     _notify();
   }
+
+  // ---------- Инвентарь ----------
+
+  List<ItemStack>? _slotList(int window) {
+    if (window == ContainerIds.inventory) return inventory;
+    if (window == ContainerIds.armor) return armor;
+    final c = container;
+    return c != null && c.windowId == window && window >= 0 ? c.slots : null;
+  }
+
+  bool _putSlot(SlotRef ref, ItemStack item) {
+    final list = _slotList(ref.window);
+    if (list == null) return false;
+    if (ref.index >= list.length) {
+      if (ref.window != ContainerIds.inventory) return false;
+      inventory = [...inventory, ...List.filled(ref.index + 1 - inventory.length, ItemStack.empty)];
+      inventory[ref.index] = item;
+      return true;
+    }
+    list[ref.index] = item;
+    return true;
+  }
+
+  ItemStack itemAt(SlotRef ref) {
+    final list = _slotList(ref.window);
+    return list != null && ref.index < list.length ? list[ref.index] : ItemStack.empty;
+  }
+
+  /// Слот инвентаря, привязанный к позиции хотбара, или −1.
+  int hotbarSlotIndex(int position) {
+    final link = hotbarLinks[position];
+    return link < 9 ? -1 : link - 9;
+  }
+
+  void _refreshHeld() {
+    if (isCreative && heldItem.id > 0 && hotbarItem(selectedHotbar).isEmpty) return;
+    heldItem = hotbarItem(selectedHotbar);
+  }
+
+  /// Изменение слотов: отправляется на сервер одной группой (сервер принимает её, если
+  /// предметы только переложены, а не созданы), локально применяется сразу.
+  void setSlots(List<(SlotRef, ItemStack)> changes) {
+    if (phase != ConnectionPhase.playing || dead) return;
+    for (final (ref, item) in changes) {
+      if (!_putSlot(ref, item)) continue;
+      _sendPacket(buildContainerSetSlot(ref.window, ref.index, item));
+    }
+    _refreshHeld();
+    _notify();
+  }
+
+  /// Скрафтить найденный рецепт: сервер сам заберёт ингредиенты из инвентаря и выдаст результат.
+  void craft(CraftMatch match) {
+    if (phase != ConnectionPhase.playing || dead) return;
+    final workbench = container?.type == WindowType.workbench;
+    _sendPacket(buildCraftingEvent(
+      window: ContainerIds.inventory,
+      type: workbench ? 1 : 0,
+      uuid: match.recipe.uuid,
+      input: match.input,
+      output: [match.recipe.result],
+    ));
+  }
+
+  /// Выбросить стопку из слота инвентаря. Сервер выбрасывает предмет из руки,
+  /// поэтому стопка сначала перекладывается в выбранный слот хотбара.
+  void dropSlot(int slot) {
+    if (phase != ConnectionPhase.playing || dead) return;
+    final item = itemAt(SlotRef(ContainerIds.inventory, slot));
+    final hand = hotbarSlotIndex(selectedHotbar);
+    if (item.isEmpty || hand < 0) return;
+    if (slot != hand) {
+      final inHand = itemAt(SlotRef(ContainerIds.inventory, hand));
+      setSlots([(SlotRef(ContainerIds.inventory, slot), inHand), (SlotRef(ContainerIds.inventory, hand), item)]);
+    }
+    _sendPacket(buildDropItem(item));
+    _putSlot(SlotRef(ContainerIds.inventory, hand), ItemStack.empty);
+    _refreshHeld();
+    _notify();
+  }
+
+  /// Закрыть сундук, печь или верстак.
+  void closeContainer() {
+    final c = container;
+    if (c == null) return;
+    if (c.windowId >= 0) _sendPacket(buildContainerClose(c.windowId));
+    container = null;
+    _notify();
+  }
+
+  /// Сколько предметов такого типа есть в инвентаре.
+  int countInInventory(ItemStack type) {
+    var n = 0;
+    for (var i = 0; i < inventory.length && i < 36; i++) {
+      if (inventory[i].sameType(type)) n += inventory[i].count;
+    }
+    return n;
+  }
+
+  int maxStack(ItemStack item) => maxStackOf(item.id);
 
   /// Отправить сообщение в чат или команду (строка начинается с '/').
   void sendMessage(String text) {

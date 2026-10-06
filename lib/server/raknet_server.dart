@@ -44,7 +44,8 @@ class RakNetServer {
     final address = lan ? InternetAddress.anyIPv4 : InternetAddress.loopbackIPv4;
     RawDatagramSocket socket;
     try {
-      socket = await RawDatagramSocket.bind(address, port);
+      // Без reuseAddress: если порт уже занят другим сервером, берётся свободный, а не общий.
+      socket = await RawDatagramSocket.bind(address, port, reuseAddress: false);
     } on SocketException {
       socket = await RawDatagramSocket.bind(address, 0);
     }

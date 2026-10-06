@@ -7,6 +7,7 @@ import 'dart:ui' as ui;
 import 'package:archive/archive_io.dart';
 import 'package:image/image.dart' as img;
 
+import '../game/items.dart';
 import 'block_names.dart';
 import 'fsb.dart';
 
@@ -153,6 +154,44 @@ class _Importer {
   /// Категория звука блока из blocks.json ("stone", "grass", "wood" …).
   final Map<int, String> blockSounds = {};
 
+  /// Иконки предметов: "id:мета" (или "id:*") → плитка атласа.
+  final Map<String, int> itemTiles = {};
+
+  void _buildItems() {
+    const emptyArmor = ['helmet', 'chestplate', 'leggings', 'boots'];
+    for (var i = 0; i < 4; i++) {
+      final path = 'textures/items/empty_armor_slot_${emptyArmor[i]}';
+      final im = _loadImage(path);
+      if (im != null) itemTiles['empty:$i'] = _addTile(path, () => im);
+    }
+    itemTable.forEach((id, info) {
+      info.icons.forEach((meta, file) {
+        final path = 'textures/items/$file';
+        final key = '$id:${meta < 0 ? '*' : meta}';
+        final existing = _tileByKey[path];
+        if (existing != null) {
+          itemTiles[key] = existing;
+          return;
+        }
+        var im = _loadImage(path);
+        if (im == null) return;
+        if (file.startsWith('leather_')) {
+          // Кожаная броня в файлах игры серая: цвет по умолчанию накладывается при отрисовке.
+          final out = img.Image.from(im);
+          for (final px in out) {
+            px
+              ..r = px.r * 0xA0 ~/ 255
+              ..g = px.g * 0x65 ~/ 255
+              ..b = px.b * 0x40 ~/ 255;
+          }
+          im = out;
+        }
+        final tileImage = im;
+        itemTiles[key] = _addTile(path, () => tileImage);
+      });
+    });
+  }
+
   Int16List build() {
     terrain = (_json('textures/terrain_texture.json') as Map)['texture_data'] as Map<String, dynamic>;
     blocks = _json('blocks.json') as Map<String, dynamic>;
@@ -164,6 +203,7 @@ class _Importer {
       if (im == null) break;
       destroyTiles.add(_addTile(path, () => im));
     }
+    _buildItems();
     blockNames.forEach((id, name) {
       final def = blocks[name];
       if (def is! Map) return;
@@ -207,6 +247,7 @@ const Set<String> _extraFiles = {
   'textures/entity/steve.png',
   'sounds/random/click.fsb',
   'sounds/random/hurt.fsb',
+  'sounds/random/pop.fsb',
   'sounds/random/glass1.fsb',
   'sounds/random/glass2.fsb',
   'sounds/random/glass3.fsb',
@@ -237,6 +278,7 @@ Future<int> importTexturePack(String sourcePath, String outDir) => Isolate.run((
               rel == 'textures/terrain_texture.json' ||
               rel.startsWith('textures/blocks/') ||
               rel.startsWith('textures/environment/') ||
+              rel.startsWith('textures/items/') ||
               rel.startsWith('sounds/dig/') ||
               rel.startsWith('sounds/step/') ||
               _extraFiles.contains(rel)) {
@@ -285,6 +327,7 @@ Future<int> importTexturePack(String sourcePath, String outDir) => Isolate.run((
         File('${dir.path}/pack.json').writeAsStringSync(jsonEncode({
           'destroy': importer.destroyTiles,
           'blockSounds': importer.blockSounds.map((k, v) => MapEntry('$k', v)),
+          'items': importer.itemTiles,
           'sounds': soundFiles,
         }));
         return importer.tiles.length;
@@ -296,7 +339,7 @@ Future<int> importTexturePack(String sourcePath, String outDir) => Isolate.run((
 /// Загруженный набор текстур: атлас блоков, спрайты интерфейса, небо, скин и звуки.
 class TexturePack {
   TexturePack._(this.dir, this.atlas, this.faces, this.gui, this.icons, this.sun, this.moon, this.steveSkinPng,
-      this.destroyTiles, this.blockSounds, this.sounds);
+      this.destroyTiles, this.blockSounds, this.sounds, this._itemTiles);
 
   final String dir;
   final ui.Image atlas;
@@ -317,6 +360,14 @@ class TexturePack {
   final Set<String> sounds;
 
   String soundPath(String name) => '$dir/sounds/$name.wav';
+
+  final Map<String, int> _itemTiles;
+
+  /// Плитка пустого слота брони (0 шлем … 3 ботинки) или −1.
+  int emptyArmorTile(int slot) => _itemTiles['empty:$slot'] ?? -1;
+
+  /// Плитка иконки предмета (ID ≥ 256) или −1.
+  int itemTile(int id, int meta) => _itemTiles['$id:$meta'] ?? _itemTiles['$id:*'] ?? _itemTiles['$id:0'] ?? -1;
 
   int tile(int id, int meta, int face) {
     final t = faces[((id & 255) * 16 + (meta & 15)) * 6 + face];
@@ -362,6 +413,7 @@ class TexturePack {
         for (final e in ((info['blockSounds'] as Map?) ?? const {}).entries) int.parse(e.key as String): e.value as String,
       },
       {for (final n in (info['sounds'] as List? ?? const [])) n as String},
+      {for (final e in ((info['items'] as Map?) ?? const {}).entries) e.key as String: e.value as int},
     );
   }
 }

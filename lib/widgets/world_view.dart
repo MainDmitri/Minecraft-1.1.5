@@ -11,6 +11,7 @@ import '../textures/texture_pack.dart';
 import '../world/blocks.dart';
 import '../world/player.dart';
 import '../world/renderer.dart';
+import 'item_icon.dart';
 import 'mc_text.dart';
 import 'mc_ui.dart';
 
@@ -47,7 +48,8 @@ class _Layout {
     };
     dpadArea = Rect.fromLTWH(origin.dx, origin.dy, 3 * cell, 3 * cell);
     hotbar = Rect.fromLTWH((size.width - 182 * s) / 2, size.height - 22 * s, 182 * s, 22 * s);
-    palette = creative ? Rect.fromLTWH(hotbar.right + 4 * s, hotbar.top + 2 * s, 18 * s, 18 * s) : null;
+    inventory = Rect.fromLTWH(hotbar.right + 4 * s, hotbar.top + 2 * s, 18 * s, 18 * s);
+    palette = creative ? Rect.fromLTWH(inventory.right + 4 * s, hotbar.top + 2 * s, 18 * s, 18 * s) : null;
     pause = Rect.fromLTWH(size.width - 22 * s, 4 * s, 18 * s, 18 * s);
     chat = Rect.fromLTWH(pause.left - 22 * s, 4 * s, 18 * s, 18 * s);
   }
@@ -57,6 +59,7 @@ class _Layout {
   late final Map<_Pad, Rect> pad;
   late final Rect dpadArea;
   late final Rect hotbar;
+  late final Rect inventory;
   late final Rect? palette;
   late final Rect pause;
   late final Rect chat;
@@ -66,34 +69,6 @@ class _Layout {
   int? slotAt(Offset p) {
     if (!hotbar.inflate(4 * s).contains(p)) return null;
     return ((p.dx - hotbar.left - s) / (20 * s)).floor().clamp(0, 8);
-  }
-}
-
-/// Значок предмета: текстура блока из атласа или цвет блока.
-void paintItem(Canvas canvas, Rect dst, ItemStack item, TexturePack? pack, {bool count = true}) {
-  if (item.isEmpty) return;
-  if (item.id < 256) {
-    final info = blockTable[item.id];
-    final tile = pack?.tile(item.id, item.meta, info.shape == BlockShape.cross ? 0 : 4) ?? -1;
-    if (pack != null && tile > 0) {
-      drawSprite(canvas, pack.atlas,
-          Rect.fromLTWH(pack.tileX(tile), pack.tileY(tile), tileSize.toDouble(), tileSize.toDouble()), dst);
-    } else {
-      canvas.drawRect(dst.deflate(dst.width * 0.1), Paint()..color = Color(blockColor(item.id, item.meta) | 0xFF000000));
-    }
-  } else {
-    final tp = TextPainter(
-      text: TextSpan(text: '#${item.id}', style: mcTextStyle(dst.height * 0.35)),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(canvas, dst.center - Offset(tp.width / 2, tp.height / 2));
-  }
-  if (count && item.count > 1) {
-    final tp = TextPainter(
-      text: TextSpan(text: '${item.count}', style: mcTextStyle(dst.height * 0.45)),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(canvas, dst.bottomRight - Offset(tp.width - dst.width * 0.05, tp.height - dst.height * 0.1));
   }
 }
 
@@ -133,6 +108,9 @@ class _WorldPainter extends CustomPainter {
       skyColor: skyColorFor(client.worldTime),
       entities: [
         for (final r in client.remotePlayers.values) EntityBox(r.position.x, r.position.y, r.position.z, r.name),
+      ],
+      dropped: [
+        for (final e in client.itemEntities.values) DroppedItem(e.position.x, e.position.y, e.position.z, e.item),
       ],
       target: hit?.block,
       breaking: overlay,
@@ -227,10 +205,19 @@ class _HudPainter extends CustomPainter {
     } else {
       canvas.drawRect(sel, outline..color = Colors.white);
     }
+    // Кнопка инвентаря, как «…» в конце хотбара MCPE.
+    canvas.drawRect(l.inventory, fill);
+    canvas.drawRect(
+        l.inventory,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = s
+          ..color = Colors.white70);
+    _label(canvas, l.inventory, '•••', 5 * s);
     final palette = l.palette;
     if (palette != null) {
       canvas.drawRect(palette, fill);
-      _label(canvas, palette, '•••', 5 * s);
+      _label(canvas, palette, '+', 8 * s);
     }
 
     // Здоровье и голод (в выживании).
@@ -311,6 +298,7 @@ class WorldView extends StatefulWidget {
     required this.renderDistance,
     required this.pack,
     required this.onPause,
+    required this.onInventory,
     this.sounds,
   });
 
@@ -319,6 +307,7 @@ class WorldView extends StatefulWidget {
   final TexturePack? pack;
   final SoundManager? sounds;
   final VoidCallback onPause;
+  final VoidCallback onInventory;
 
   @override
   State<WorldView> createState() => WorldViewState();
@@ -339,6 +328,8 @@ class WorldViewState extends State<WorldView> with SingleTickerProviderStateMixi
   bool _lookMoved = false;
   bool _breaking = false;
   Timer? _holdTimer;
+  Timer? _dropTimer;
+  int? _dropPointer;
 
   bool _chatOpen = false;
   final TextEditingController _chatInput = TextEditingController();
@@ -377,6 +368,7 @@ class WorldViewState extends State<WorldView> with SingleTickerProviderStateMixi
     _ticker.dispose();
     _frame.dispose();
     _holdTimer?.cancel();
+    _dropTimer?.cancel();
     _chatInput.dispose();
     _chatFocus.dispose();
     final p = widget.client.player;
@@ -439,6 +431,10 @@ class WorldViewState extends State<WorldView> with SingleTickerProviderStateMixi
       _chatOpen ? setState(() => _chatOpen = false) : openChat();
       return;
     }
+    if (l.inventory.inflate(4).contains(pos)) {
+      widget.onInventory();
+      return;
+    }
     final palette = l.palette;
     if (palette != null && palette.inflate(4).contains(pos)) {
       _openCreativePalette();
@@ -447,6 +443,14 @@ class WorldViewState extends State<WorldView> with SingleTickerProviderStateMixi
     final slot = l.slotAt(pos);
     if (slot != null) {
       c.selectHotbar(slot);
+      // Удержание слота хотбара — выбросить стопку, как в MCPE.
+      _dropTimer?.cancel();
+      _dropPointer = e.pointer;
+      _dropTimer = Timer(const Duration(milliseconds: 700), () {
+        if (_dropPointer != e.pointer) return;
+        final index = c.hotbarSlotIndex(slot);
+        if (index >= 0) c.dropSlot(index);
+      });
       return;
     }
     if (l.dpadArea.contains(pos) || (l.pad[_Pad.flyDown]?.contains(pos) ?? false)) {
@@ -482,6 +486,11 @@ class WorldViewState extends State<WorldView> with SingleTickerProviderStateMixi
   }
 
   void _onUp(PointerEvent e) {
+    if (e.pointer == _dropPointer) {
+      _dropPointer = null;
+      _dropTimer?.cancel();
+      return;
+    }
     if (_padPointers.containsKey(e.pointer)) {
       _padPointers.remove(e.pointer);
       _pressed

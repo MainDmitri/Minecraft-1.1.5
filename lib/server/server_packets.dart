@@ -360,3 +360,66 @@ Uint8List spRespawn(double x, double eyeY, double z) => encodePacket(PacketId.re
         ..floatLE(eyeY)
         ..floatLE(z);
     });
+
+Uint8List spContainerOpen(int window, int type, int x, int y, int z, int entityId) =>
+    encodePacket(PacketId.containerOpen, (w) {
+      w
+        ..byte(window)
+        ..byte(type)
+        ..varint(x)
+        ..uvarint(y)
+        ..varint(z)
+        ..varint(entityId);
+    });
+
+Uint8List spContainerClose(int window) => encodePacket(PacketId.containerClose, (w) => w.byte(window));
+
+Uint8List spContainerSetData(int window, int property, int value) => encodePacket(PacketId.containerSetData, (w) {
+      w
+        ..byte(window)
+        ..varint(property)
+        ..varint(value);
+    });
+
+Uint8List spMobArmorEquipment(int entityId, List<ServerItem> armor) => encodePacket(PacketId.mobArmorEquipment, (w) {
+      w.uvarint(entityId);
+      for (final a in armor) {
+        a.write(w);
+      }
+    });
+
+Uint8List spAddItemEntity(int entityId, ServerItem item, double x, double y, double z, double vx, double vy, double vz) =>
+    encodePacket(PacketId.addItemEntity, (w) {
+      w
+        ..varint(entityId)
+        ..uvarint(entityId);
+      item.write(w);
+      w
+        ..floatLE(x)
+        ..floatLE(y)
+        ..floatLE(z)
+        ..floatLE(vx)
+        ..floatLE(vy)
+        ..floatLE(vz)
+        ..uvarint(0); // метаданные
+    });
+
+Uint8List spTakeItemEntity(int itemId, int playerId) => encodePacket(PacketId.takeItemEntity, (w) {
+      w
+        ..uvarint(itemId)
+        ..uvarint(playerId);
+    });
+
+Uint8List spMoveEntity(int entityId, double x, double y, double z, {bool onGround = false}) =>
+    encodePacket(PacketId.moveEntity, (w) {
+      w
+        ..uvarint(entityId)
+        ..floatLE(x)
+        ..floatLE(y)
+        ..floatLE(z)
+        ..byte(0)
+        ..byte(0)
+        ..byte(0)
+        ..boolean(onGround)
+        ..boolean(false);
+    });

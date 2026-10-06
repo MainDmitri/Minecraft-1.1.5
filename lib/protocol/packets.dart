@@ -20,18 +20,29 @@ class PacketId {
   static const startGame = 0x0b;
   static const addPlayer = 0x0c;
   static const removeEntity = 0x0e;
+  static const addItemEntity = 0x0f;
+  static const takeItemEntity = 0x11;
+  static const moveEntity = 0x12;
   static const movePlayer = 0x13;
   static const removeBlock = 0x15;
   static const updateBlock = 0x16;
   static const levelEvent = 0x1a;
   static const updateAttributes = 0x1e;
   static const mobEquipment = 0x1f;
+  static const mobArmorEquipment = 0x20;
   static const useItem = 0x23;
   static const playerAction = 0x24;
   static const setSpawnPosition = 0x2b;
+  static const setEntityMotion = 0x28;
   static const respawn = 0x2d;
+  static const dropItem = 0x2e;
+  static const containerOpen = 0x30;
+  static const containerClose = 0x31;
   static const containerSetSlot = 0x32;
+  static const containerSetData = 0x33;
   static const containerSetContent = 0x34;
+  static const craftingData = 0x35;
+  static const craftingEvent = 0x36;
   static const adventureSettings = 0x37;
   static const fullChunkData = 0x3a;
   static const setDifficulty = 0x3c;
@@ -44,6 +55,21 @@ class PacketId {
   static const commandStep = 0x4f;
   static const transfer = 0x56;
   static const setTitle = 0x59;
+}
+
+/// Особые окна инвентаря.
+class ContainerIds {
+  static const inventory = 0;
+  static const armor = 0x78;
+  static const creative = 0x79;
+  static const hotbar = 0x7a;
+}
+
+/// Типы окон в ContainerOpenPacket.
+class WindowType {
+  static const container = 0;
+  static const workbench = 1;
+  static const furnace = 2;
 }
 
 class PlayStatus {
@@ -92,6 +118,53 @@ class ItemStack {
   static final ItemStack empty = ItemStack(0, 0, 0, Uint8List.fromList(const [0]));
 
   bool get isEmpty => id <= 0 || count <= 0;
+
+  /// Предмет без NBT.
+  static ItemStack simple(int id, int meta, int count) {
+    if (id <= 0 || count <= 0) return empty;
+    final w = BinaryWriter()
+      ..varint(id)
+      ..varint(((meta & 0x7fff) << 8) | (count & 0xff))
+      ..shortLE(0)
+      ..varint(0)
+      ..varint(0);
+    return ItemStack(id, meta, count, w.take());
+  }
+
+  /// Тот же предмет (с NBT и прочим) в количестве [n].
+  ItemStack withCount(int n) {
+    if (isEmpty || n <= 0) return empty;
+    if (n == count) return this;
+    final r = BinaryReader(raw)
+      ..varint()
+      ..varint();
+    final w = BinaryWriter()
+      ..varint(id)
+      ..varint(((meta & 0x7fff) << 8) | (n & 0xff))
+      ..bytes(r.rest());
+    return ItemStack(id, meta, n, w.take());
+  }
+
+  /// Один и тот же предмет (ID, мета и NBT), количество не важно.
+  bool sameType(ItemStack other) {
+    if (isEmpty || other.isEmpty) return isEmpty && other.isEmpty;
+    if (id != other.id || meta != other.meta) return false;
+    final a = BinaryReader(raw)
+      ..varint()
+      ..varint();
+    final b = BinaryReader(other.raw)
+      ..varint()
+      ..varint();
+    final ta = a.rest(), tb = b.rest();
+    if (ta.length != tb.length) return false;
+    for (var i = 0; i < ta.length; i++) {
+      if (ta[i] != tb[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  String toString() => isEmpty ? 'air' : '$id:$meta×$count';
 }
 
 ItemStack readItem(BinaryReader r) {
@@ -516,4 +589,44 @@ Uint8List buildCommandStep({
         ..string(inputJson)
         ..string('null')
         ..bytes(const [0, 0, 0]);
+    });
+
+Uint8List buildContainerSetSlot(int window, int slot, ItemStack item, {int hotbarSlot = 0, int selectedSlot = 0}) =>
+    encodePacket(PacketId.containerSetSlot, (w) {
+      w
+        ..byte(window)
+        ..varint(slot)
+        ..varint(hotbarSlot)
+        ..bytes(item.raw)
+        ..byte(selectedSlot);
+    });
+
+Uint8List buildContainerClose(int window) => encodePacket(PacketId.containerClose, (w) => w.byte(window));
+
+Uint8List buildDropItem(ItemStack item) => encodePacket(PacketId.dropItem, (w) {
+      w
+        ..byte(0)
+        ..bytes(item.raw);
+    });
+
+Uint8List buildCraftingEvent({
+  required int window,
+  required int type,
+  required Uint8List uuid,
+  required List<ItemStack> input,
+  required List<ItemStack> output,
+}) =>
+    encodePacket(PacketId.craftingEvent, (w) {
+      w
+        ..byte(window)
+        ..varint(type)
+        ..bytes(uuid)
+        ..uvarint(input.length);
+      for (final i in input) {
+        w.bytes(i.raw);
+      }
+      w.uvarint(output.length);
+      for (final o in output) {
+        w.bytes(o.raw);
+      }
     });
