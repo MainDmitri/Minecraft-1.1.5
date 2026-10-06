@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 import 'screens/servers_screen.dart';
 import 'state/session_controller.dart';
 import 'state/settings_store.dart';
+import 'state/texture_store.dart';
+import 'widgets/mc_ui.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -12,6 +14,7 @@ void main() {
       providers: [
         ChangeNotifierProvider(create: (_) => SettingsStore()..load()),
         ChangeNotifierProvider(create: (_) => SessionController()),
+        ChangeNotifierProvider(create: (_) => TextureStore()..load()),
       ],
       child: const McpeClientApp(),
     ),
@@ -27,8 +30,8 @@ class McpeClientApp extends StatelessWidget {
     return MaterialApp(
       title: 'MCPE 1.1.5 Client',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.light, useMaterial3: true),
-      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      theme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      builder: (context, child) => McDirtBackground(pack: context.watch<TextureStore>().pack, child: child!),
       home: const ServersScreen(),
     );
   }

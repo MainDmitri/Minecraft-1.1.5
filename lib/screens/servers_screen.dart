@@ -1,5 +1,9 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 
 import '../protocol/login.dart';
@@ -8,6 +12,7 @@ import '../protocol/raknet.dart';
 import '../server/worlds.dart';
 import '../state/session_controller.dart';
 import '../state/settings_store.dart';
+import '../state/texture_store.dart';
 import '../widgets/mc_text.dart';
 import 'game_screen.dart';
 import 'worlds_section.dart';
@@ -64,6 +69,86 @@ class _ServersScreenState extends State<ServersScreen> {
     }
   }
 
+  Future<void> _useSteveSkin(Uint8List png) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await context.read<SettingsStore>().setSkinFromPng(png);
+      messenger.showSnackBar(const SnackBar(content: Text('Установлен скин Стива')));
+    } on FormatException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+    }
+  }
+
+  Future<void> _importTextures() async {
+    final textures = context.read<TextureStore>();
+    final messenger = ScaffoldMessenger.of(context);
+    final picked = await FilePicker.pickFile(type: FileType.any);
+    if (picked == null) return;
+    var path = picked.path;
+    File? temp;
+    if (path == null) {
+      // Файл из системного выбора (content://) копируется во временную папку.
+      temp = File('${(await getTemporaryDirectory()).path}/mcpe_import.zip');
+      final sink = temp.openWrite();
+      await sink.addStream(picked.readAsByteStream());
+      await sink.close();
+      path = temp.path;
+    }
+    await textures.importFrom(path);
+    if (temp != null && temp.existsSync()) await temp.delete();
+    messenger.showSnackBar(SnackBar(content: Text(textures.error ?? 'Текстуры загружены')));
+  }
+
+  Widget _texturesCard(TextureStore textures) {
+    final loaded = textures.pack != null;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.texture),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(loaded ? 'Текстуры Minecraft загружены' : 'Текстуры Minecraft',
+                      style: Theme.of(context).textTheme.titleMedium),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(loaded
+                ? 'Мир и интерфейс рисуются текстурами из вашего файла игры.'
+                : 'Выберите свой APK Minecraft PE 1.1.x или zip-архив с его файлами: '
+                    'текстуры блоков и интерфейса будут взяты оттуда и сохранены только на этом телефоне.'),
+            if (textures.error != null)
+              Text(textures.error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            const SizedBox(height: 8),
+            if (textures.busy)
+              const Row(children: [
+                SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 12),
+                Text('Извлечение текстур…'),
+              ])
+            else
+              Wrap(
+                spacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _importTextures,
+                    icon: const Icon(Icons.file_open),
+                    label: Text(loaded ? 'Заменить' : 'Загрузить из файла игры'),
+                  ),
+                  if (loaded) OutlinedButton(onPressed: textures.remove, child: const Text('Удалить')),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// Проверка ника перед входом; возвращает ник или null.
   Future<String?> _checkedNickname() async {
     final store = context.read<SettingsStore>();
@@ -106,9 +191,13 @@ class _ServersScreenState extends State<ServersScreen> {
       _nickController.text = store.nickname;
       _nickInitialized = true;
     }
+    final textures = context.watch<TextureStore>();
+    final steve = textures.pack?.steveSkinPng;
     return Scaffold(
+      backgroundColor: textures.pack == null ? null : Colors.transparent,
       appBar: AppBar(
-        title: const Text('MCPE $mcpeVersion — серверы'),
+        backgroundColor: textures.pack == null ? null : const Color(0xCC1E1E1E),
+        title: const Text('Minecraft PE $mcpeVersion'),
         actions: [
           IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: 'Обновить статус'),
         ],
@@ -121,6 +210,8 @@ class _ServersScreenState extends State<ServersScreen> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
         children: [
+          _texturesCard(textures),
+          const SizedBox(height: 8),
           TextField(
             controller: _nickController,
             maxLength: 16,
@@ -142,6 +233,12 @@ class _ServersScreenState extends State<ServersScreen> {
                 children: [
                   if (store.customSkin)
                     IconButton(onPressed: store.resetSkin, icon: const Icon(Icons.restart_alt), tooltip: 'Сбросить'),
+                  if (steve != null)
+                    IconButton(
+                      onPressed: () => _useSteveSkin(steve),
+                      icon: const Icon(Icons.face),
+                      tooltip: 'Скин Стива из файла игры',
+                    ),
                   IconButton(onPressed: _pickSkin, icon: const Icon(Icons.upload_file), tooltip: 'Выбрать PNG'),
                 ],
               ),

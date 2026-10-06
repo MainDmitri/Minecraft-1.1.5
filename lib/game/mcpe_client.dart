@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../protocol/binary.dart';
@@ -19,6 +20,17 @@ import 'lang.dart';
 enum ConnectionPhase { idle, connecting, loggingIn, spawning, playing, disconnected }
 
 enum ChatKind { chat, system, local, error }
+
+enum SoundKind { breakBlock, placeBlock, step, hit, hurt }
+
+/// Игровой звук: вид, блок (его материал определяет звук) и громкость 0..1.
+class GameSound {
+  const GameSound(this.kind, this.blockId, this.volume);
+
+  final SoundKind kind;
+  final int blockId;
+  final double volume;
+}
 
 class ChatLine {
   ChatLine(this.text, this.kind) : time = DateTime.now();
@@ -87,6 +99,11 @@ class McpeClient {
   /// Срабатывает при изменении состояния, важного для интерфейса.
   Stream<void> get changes => _changes.stream;
 
+  final StreamController<GameSound> _sounds = StreamController<GameSound>.broadcast();
+
+  /// Звуки ломания, установки блоков, шагов и урона.
+  Stream<GameSound> get sounds => _sounds.stream;
+
   RakNetClient? _rak;
   PacketCipher? _cipher;
   LoginData? _login;
@@ -145,6 +162,14 @@ class McpeClient {
   DateTime? _breakStart;
   Duration? _breakDuration;
 
+  // Звуки: пройденное расстояние до следующего шага, ожидаемая установка блока, последний сломанный блок.
+  double _walked = 0;
+  BlockPos? _placeAt;
+  BlockPos? _placeAgainst;
+  DateTime _placeTime = DateTime(0);
+  BlockPos? _lastBroken;
+  DateTime _lastBrokenTime = DateTime(0);
+
   // Последняя отправленная позиция.
   double _sentX = 0, _sentY = 0, _sentZ = 0, _sentYaw = 0, _sentPitch = 0;
 
@@ -182,6 +207,16 @@ class McpeClient {
 
   void _notify() {
     if (!_changes.isClosed) _changes.add(null);
+  }
+
+  void _sound(SoundKind kind, int blockId, [double volume = 1]) {
+    if (!_sounds.isClosed && volume > 0) _sounds.add(GameSound(kind, blockId, volume));
+  }
+
+  /// Громкость звука в точке по расстоянию до игрока (слышно до 16 блоков).
+  double _volumeAt(double x, double y, double z) {
+    final dx = x - player.x, dy = y - player.y, dz = z - player.z;
+    return (1 - math.sqrt(dx * dx + dy * dy + dz * dz) / 16).clamp(0.0, 1.0);
   }
 
   void _addChat(String text, ChatKind kind) {
@@ -248,6 +283,7 @@ class McpeClient {
     disconnect('Сессия закрыта');
     _tickTimer?.cancel();
     _changes.close();
+    _sounds.close();
   }
 
   // ---------- Пакетный уровень ----------
@@ -349,7 +385,9 @@ class McpeClient {
         final x = r.varint(), y = r.uvarint(), z = r.varint();
         final blockId = r.uvarint();
         final flagsMeta = r.uvarint();
+        final previous = level.blockId(x, y, z);
         level.setBlock(x, y, z, blockId, flagsMeta & 0x0f);
+        _onBlockChanged(BlockPos(x, y, z), previous, blockId);
         break;
       case PacketId.levelEvent:
         _onLevelEvent(r.varint(), Vec3.read(r), r.varint());
@@ -467,11 +505,9 @@ class McpeClient {
   void _onPlayStatus(int status) {
     switch (status) {
       case PlayStatus.loginSuccess:
-        _addChat('Вход выполнен, загрузка мира…', ChatKind.local);
         break;
       case PlayStatus.playerSpawn:
         phase = ConnectionPhase.playing;
-        _addChat('Вы в игре', ChatKind.local);
         _tickTimer?.cancel();
         _tickTimer = Timer.periodic(const Duration(milliseconds: 50), (_) => _tick());
         if (_spawned != null && !_spawned!.isCompleted) _spawned!.complete();
@@ -569,7 +605,23 @@ class McpeClient {
     _notify();
   }
 
+  void _onBlockChanged(BlockPos pos, int previous, int current) {
+    if (current == 0 || current == previous) return;
+    final recent = DateTime.now().difference(_placeTime) < const Duration(seconds: 2);
+    if (recent && (pos == _placeAt || pos == _placeAgainst)) {
+      _placeAt = _placeAgainst = null;
+      _sound(SoundKind.placeBlock, current);
+    }
+  }
+
   void _onLevelEvent(int event, Vec3 pos, int data) {
+    if (event == LevelEventId.particleDestroy) {
+      // Блок сломал другой игрок (свой уже озвучен при ломании).
+      final p = BlockPos(pos.x.floor(), pos.y.floor(), pos.z.floor());
+      final own = p == _lastBroken && DateTime.now().difference(_lastBrokenTime) < const Duration(seconds: 2);
+      if (!own) _sound(SoundKind.breakBlock, data & 0xff, _volumeAt(pos.x, pos.y, pos.z));
+      return;
+    }
     final b = breakingBlock;
     if (event != LevelEventId.blockStartBreak || b == null || data <= 0) return;
     if (pos.x.floor() == b.x && pos.y.floor() == b.y && pos.z.floor() == b.z) {
@@ -608,6 +660,7 @@ class McpeClient {
     for (final a in list) {
       switch (a.name) {
         case 'minecraft:health':
+          if (hasPosition && a.value < health && a.value > 0) _sound(SoundKind.hurt, 0);
           health = a.value;
           maxHealth = a.max;
           final wasDead = dead;
@@ -683,6 +736,7 @@ class McpeClient {
     lastTick = DateTime.now();
     if (!dead) {
       player.tick(level);
+      _footsteps();
       _sendMovement();
       _updateBreaking();
     }
@@ -690,6 +744,20 @@ class McpeClient {
       level.unloadFar(player.x.floor() >> 4, player.z.floor() >> 4, serverChunkRadius + 3);
     }
     if (_tickCount % 5 == 0) _notify();
+  }
+
+  /// Звук шага примерно каждые полтора блока ходьбы по земле.
+  void _footsteps() {
+    if (!player.onGround || player.flying || player.inWater) {
+      _walked = 0;
+      return;
+    }
+    final dx = player.x - prevX, dz = player.z - prevZ;
+    _walked += math.sqrt(dx * dx + dz * dz);
+    if (_walked < 1.6) return;
+    _walked = 0;
+    final below = level.blockId(player.x.floor(), (player.y - 0.2).floor(), player.z.floor());
+    if (below != 0) _sound(SoundKind.step, below, 0.3);
   }
 
   void _sendMovement() {
@@ -767,7 +835,13 @@ class McpeClient {
     // Сервер не прислал время ломания — значит, блок ломается мгновенно.
     if (_breakDuration == null && elapsed > const Duration(milliseconds: 400)) _breakDuration = Duration.zero;
     final duration = _breakDuration;
-    if (duration == null || elapsed < duration) return;
+    if (duration == null || elapsed < duration) {
+      if (_tickCount % 4 == 0) _sound(SoundKind.hit, level.blockId(b.x, b.y, b.z), 0.25);
+      return;
+    }
+    _sound(SoundKind.breakBlock, level.blockId(b.x, b.y, b.z));
+    _lastBroken = b;
+    _lastBrokenTime = now;
     _sendPacket(buildPlayerAction(id, PlayerActionType.stopBreak, b.x, b.y, b.z, face: _breakFace));
     _sendPacket(buildRemoveBlock(b.x, b.y, b.z));
     level.setBlock(b.x, b.y, b.z, 0, 0);
@@ -785,6 +859,9 @@ class McpeClient {
     if (hit == null) return;
     final item = heldItem;
     if (!item.isEmpty && item.id < 256 && blockTable[item.id].solid && player.intersects(hit.adjacent)) return;
+    _placeAt = hit.adjacent;
+    _placeAgainst = hit.block;
+    _placeTime = DateTime.now();
     _sendPacket(buildUseItem(
       x: hit.block.x,
       y: hit.block.y,
@@ -846,7 +923,6 @@ class McpeClient {
           clientId: _login?.clientRandomId ?? 0,
           inputJson: call.inputJson,
         ));
-        _addChat(message, ChatKind.local);
       } on CommandParseException catch (e) {
         _addChat(e.message, ChatKind.error);
       }

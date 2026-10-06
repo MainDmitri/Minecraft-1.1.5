@@ -75,6 +75,7 @@ class PlayerActionType {
 }
 
 class LevelEventId {
+  static const particleDestroy = 2001;
   static const blockStartBreak = 3600;
 }
 

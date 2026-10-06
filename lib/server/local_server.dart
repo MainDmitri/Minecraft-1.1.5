@@ -697,7 +697,14 @@ class LocalServer {
       if (drop != null) _give(p, drop);
     }
     p.breakStart = null;
+    final meta = _blockMeta(x, y, z);
     _setBlock(x, y, z, 0, 0);
+    // Остальные игроки рядом видят и слышат разрушение блока.
+    final destroy = spLevelEvent(LevelEventId.particleDestroy, x + 0.5, y + 0.5, z + 0.5, id | (meta << 8));
+    final key = chunkKey(x >> 4, z >> 4);
+    for (final other in _online) {
+      if (other != p && other.sentChunks.contains(key)) _send(other, [destroy]);
+    }
   }
 
   void _give(_ServerPlayer p, ServerItem item) {

@@ -215,21 +215,23 @@ final Map<int, BlockInfo> _blocks = {
   195: _see(0xFF9A6E44),
   196: _see(0xFFAD5D32),
   197: _see(0xFF422A13),
-  198: _plant(0xFFE8E0D0), // стержень Края
-  199: _plant(0xFF5E3A6E), // растение хоруса
+  198: _cube(0xFF946D45, top: 0xFF9A8A45), // тропинка
+  199: _plant(0xFF8B6B3E), // рамка
   200: _cube(0xFF8A5E8A), // цветок хоруса
   201: _cube(0xFFA77BA7), // пурпур
   203: _cube(0xFFA77BA7),
   205: _cube(0xFF8E5E9E), // шалкер
   206: _cube(0xFFDDE0A5),
   207: _plant(0xFF5E8A2E), // свёкла
-  208: _cube(0xFF946D45, top: 0xFF9A8A45), // тропинка
+  208: _plant(0xFFE8E0D0), // стержень Края
   213: _cube(0xFFC0491B), // магма
   214: _cube(0xFF7A0F10), // блок адского нароста
   215: _cube(0xFF450707),
   216: _cube(0xFFE0DCCB), // костяной блок
   218: _cube(0xFF8E5E9E),
+  for (var id = 219; id <= 235; id++) id: _cube(dyeColors[(id - 219 + 10) % 16]), // глазурованная керамика
   236: _cube(0xFF7D7D7D), // бетон
+  240: _plant(0xFF5E3A6E), // растение хоруса
   237: _cube(0xFF9A9A9A), // цементный порошок
   241: _see(0x88FFFFFF),
   243: _cube(0xFF5A3E26, top: 0xFF6A5A30), // подзол
