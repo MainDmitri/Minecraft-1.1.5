@@ -76,6 +76,9 @@ class _WorldViewState extends State<WorldView> with SingleTickerProviderStateMix
   Offset? _stickOrigin;
   Offset _stick = Offset.zero;
   int? _lookPointer;
+  bool _chatOpen = false;
+  final TextEditingController _chatInput = TextEditingController();
+  final FocusNode _chatFocus = FocusNode();
 
   static const double _stickRadius = 56;
   static const double _lookSensitivity = 0.25;
@@ -96,6 +99,8 @@ class _WorldViewState extends State<WorldView> with SingleTickerProviderStateMix
   void dispose() {
     _ticker.dispose();
     _frame.dispose();
+    _chatInput.dispose();
+    _chatFocus.dispose();
     final p = widget.client.player;
     p.forward = p.strafe = 0;
     p.jump = p.descend = false;
@@ -217,8 +222,15 @@ class _WorldViewState extends State<WorldView> with SingleTickerProviderStateMix
   @override
   Widget build(BuildContext context) {
     final c = widget.client;
-    final recent = c.chat.where((l) => DateTime.now().difference(l.time) < const Duration(seconds: 10)).toList();
-    final shown = recent.length > 5 ? recent.sublist(recent.length - 5) : recent;
+    // Сообщения сервера (например, просьба зарегистрироваться) видны сразу после входа;
+    // с открытым чатом — вся недавняя история.
+    final List<ChatLine> shown;
+    if (_chatOpen) {
+      shown = c.chat.length > 30 ? c.chat.sublist(c.chat.length - 30) : c.chat;
+    } else {
+      final recent = c.chat.where((l) => DateTime.now().difference(l.time) < const Duration(seconds: 30)).toList();
+      shown = recent.length > 8 ? recent.sublist(recent.length - 8) : recent;
+    }
     return LayoutBuilder(builder: (context, constraints) {
       final size = constraints.biggest;
       return Stack(
@@ -374,25 +386,78 @@ class _WorldViewState extends State<WorldView> with SingleTickerProviderStateMix
               ],
             ),
           ),
-          // Последние сообщения чата.
+          // Сообщения чата.
           Positioned(
             left: 8,
-            top: 8,
+            top: 60,
             right: size.width * 0.35,
+            bottom: _chatOpen ? 120 : null,
             child: IgnorePointer(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  for (final l in shown)
-                    Container(
-                      color: Colors.black38,
-                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                      child: McText(l.text, style: const TextStyle(color: Colors.white, fontSize: 13), maxLines: 2),
-                    ),
-                ],
+              ignoring: !_chatOpen,
+              child: SingleChildScrollView(
+                reverse: true,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final l in shown)
+                      Container(
+                        color: Colors.black45,
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                        child: McText(l.text, style: const TextStyle(color: Colors.white, fontSize: 13), maxLines: _chatOpen ? null : 2),
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
+          // Кнопка чата.
+          Positioned(
+            left: 8,
+            top: 8,
+            child: _tapButton(Icons.chat, 'Чат', () {
+              setState(() => _chatOpen = !_chatOpen);
+              if (_chatOpen) _chatFocus.requestFocus();
+            }, active: _chatOpen),
+          ),
+          // Поле ввода чата и команд.
+          if (_chatOpen)
+            Positioned(
+              left: 8,
+              right: 8,
+              bottom: 60,
+              child: Material(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(8),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _chatInput,
+                          focusNode: _chatFocus,
+                          maxLength: 255,
+                          style: const TextStyle(color: Colors.white),
+                          textInputAction: TextInputAction.send,
+                          decoration: const InputDecoration(
+                            hintText: 'Сообщение или /команда',
+                            hintStyle: TextStyle(color: Colors.white54),
+                            border: InputBorder.none,
+                            counterText: '',
+                          ),
+                          onSubmitted: (_) => _sendChat(),
+                        ),
+                      ),
+                      IconButton(onPressed: _sendChat, icon: const Icon(Icons.send, color: Colors.white)),
+                      IconButton(
+                        onPressed: () => setState(() => _chatOpen = false),
+                        icon: const Icon(Icons.close, color: Colors.white),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           // Здоровье, голод, координаты.
           Positioned(
             right: 8,
@@ -419,6 +484,14 @@ class _WorldViewState extends State<WorldView> with SingleTickerProviderStateMix
         ],
       );
     });
+  }
+
+  void _sendChat() {
+    final text = _chatInput.text;
+    if (text.trim().isEmpty) return;
+    widget.client.sendMessage(text);
+    _chatInput.clear();
+    _chatFocus.requestFocus();
   }
 
   static String _facing(double yaw) {

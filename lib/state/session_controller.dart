@@ -6,13 +6,21 @@ import 'package:flutter/foundation.dart';
 import '../game/mcpe_client.dart';
 import '../protocol/raknet.dart';
 import '../protocol/skin.dart';
+import '../server/local_server.dart';
+import '../server/worlds.dart';
 
-/// Текущая игровая сессия для экрана игры.
+/// Текущая игровая сессия: подключение к серверу или к своему локальному миру.
 class SessionController extends ChangeNotifier {
   McpeClient? client;
   StreamSubscription<void>? _sub;
   String? error;
   bool connecting = false;
+
+  LocalServer? server;
+  StreamSubscription<String>? _serverLog;
+  bool serverLan = false;
+  List<String> lanAddresses = const [];
+  final List<String> serverLog = [];
 
   String _host = '';
   int _port = 19132;
@@ -20,6 +28,8 @@ class SessionController extends ChangeNotifier {
   SkinData? _skin;
 
   String get address => '$_host:$_port';
+
+  bool get isHosting => server != null;
 
   Future<void> connect({
     required String host,
@@ -32,6 +42,41 @@ class SessionController extends ChangeNotifier {
     _nickname = nickname;
     _skin = skin;
     await _start();
+  }
+
+  /// Запустить локальный мир и войти в него. [lan] — разрешить вход другим по IP.
+  Future<void> hostWorld({
+    required LocalWorldEntry world,
+    required bool lan,
+    required String nickname,
+    required SkinData skin,
+  }) async {
+    await _stopServer();
+    error = null;
+    connecting = true;
+    serverLog.clear();
+    notifyListeners();
+    final s = LocalServer(storage: world.storage, lan: lan);
+    try {
+      final port = await s.start();
+      server = s;
+      serverLan = lan;
+      _serverLog = s.log.listen((line) {
+        serverLog.add(line);
+        if (serverLog.length > 100) serverLog.removeAt(0);
+        notifyListeners();
+      });
+      lanAddresses = lan ? await localIpAddresses() : const [];
+      await connect(host: '127.0.0.1', port: port, nickname: nickname, skin: skin);
+    } on SocketException catch (e) {
+      error = 'Не удалось запустить сервер: ${e.message}';
+      connecting = false;
+      notifyListeners();
+    } on FileSystemException catch (e) {
+      error = 'Не удалось прочитать мир: ${e.message}';
+      connecting = false;
+      notifyListeners();
+    }
   }
 
   Future<void> reconnect() => _start();
@@ -89,8 +134,18 @@ class SessionController extends ChangeNotifier {
     client = null;
   }
 
-  void close() {
+  Future<void> _stopServer() async {
+    final s = server;
+    server = null;
+    await _serverLog?.cancel();
+    _serverLog = null;
+    if (s != null) await s.stop();
+  }
+
+  /// Выход на экран серверов: отключение и остановка своего сервера (мир сохраняется).
+  Future<void> close() async {
     _closeClient();
+    await _stopServer();
     error = null;
     connecting = false;
     notifyListeners();
@@ -99,6 +154,7 @@ class SessionController extends ChangeNotifier {
   @override
   void dispose() {
     _closeClient();
+    _stopServer();
     super.dispose();
   }
 }

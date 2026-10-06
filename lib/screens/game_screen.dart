@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../game/mcpe_client.dart';
@@ -117,6 +118,55 @@ class _GameScreenState extends State<GameScreen> {
     return 'Координаты: $pos · ${dist.toStringAsFixed(0)} бл.';
   }
 
+  void _showServerInfo(SessionController session) {
+    final port = session.server?.port ?? 0;
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        builder: (_, scroll) => ListView(
+          controller: scroll,
+          padding: const EdgeInsets.all(16),
+          children: [
+            Text('Сервер мира запущен на этом телефоне', style: Theme.of(ctx).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (!session.serverLan)
+              const Text('Мир открыт только для вас. Чтобы друзья могли зайти, выйдите и запустите мир '
+                  'кнопкой «Играть и открыть по сети».')
+            else ...[
+              const Text('Друзья в той же Wi-Fi сети: «Добавить сервер» → адрес и порт ниже '
+                  '(в MCPE 1.1.5 — вкладка «Друзья» или «Серверы»).'),
+              const SizedBox(height: 8),
+              if (session.lanAddresses.isEmpty)
+                const Text('Телефон не подключён к сети (нет IPv4-адреса Wi-Fi).')
+              else
+                for (final ip in session.lanAddresses)
+                  ListTile(
+                    leading: const Icon(Icons.wifi),
+                    title: SelectableText('$ip:$port'),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.copy),
+                      tooltip: 'Копировать',
+                      onPressed: () => Clipboard.setData(ClipboardData(text: '$ip:$port')),
+                    ),
+                  ),
+              if (port != 19132)
+                Text('Порт 19132 был занят, выбран порт $port — сообщите его друзьям.',
+                    style: TextStyle(color: Theme.of(ctx).colorScheme.error)),
+            ],
+            const Divider(height: 24),
+            Text('Журнал', style: Theme.of(ctx).textTheme.titleSmall),
+            if (session.serverLog.isEmpty) const Text('Пока пусто'),
+            for (final line in session.serverLog.reversed) Text(line),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _showCommands(McpeClient c) {
     showModalBottomSheet<void>(
       context: context,
@@ -183,11 +233,13 @@ class _GameScreenState extends State<GameScreen> {
             ),
             tooltip: 'Игроки',
           ),
+          if (session.isHosting)
+            IconButton(onPressed: () => _showServerInfo(session), icon: const Icon(Icons.dns), tooltip: 'Мой сервер'),
           IconButton(onPressed: () => _showCommands(c), icon: const Icon(Icons.terminal), tooltip: 'Команды'),
           IconButton(
             onPressed: () => setState(() => _showChat = !_showChat),
-            icon: Icon(_showChat ? Icons.view_in_ar : Icons.chat),
-            tooltip: _showChat ? 'Мир' : 'Чат',
+            icon: Icon(_showChat ? Icons.view_in_ar : Icons.forum),
+            tooltip: _showChat ? 'Мир' : 'Весь чат',
           ),
           if (!disconnected)
             IconButton(onPressed: session.disconnect, icon: const Icon(Icons.logout), tooltip: 'Отключиться'),

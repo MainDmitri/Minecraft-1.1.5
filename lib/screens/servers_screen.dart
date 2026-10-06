@@ -5,10 +5,12 @@ import 'package:provider/provider.dart';
 import '../protocol/login.dart';
 import '../protocol/packets.dart';
 import '../protocol/raknet.dart';
+import '../server/worlds.dart';
 import '../state/session_controller.dart';
 import '../state/settings_store.dart';
 import '../widgets/mc_text.dart';
 import 'game_screen.dart';
+import 'worlds_section.dart';
 
 class ServersScreen extends StatefulWidget {
   const ServersScreen({super.key});
@@ -62,21 +64,36 @@ class _ServersScreenState extends State<ServersScreen> {
     }
   }
 
-  Future<void> _join(ServerEntry s) async {
+  /// Проверка ника перед входом; возвращает ник или null.
+  Future<String?> _checkedNickname() async {
     final store = context.read<SettingsStore>();
     final nick = _nickController.text.trim();
     final nickError = validateNickname(nick);
     if (nickError != null) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(nickError)));
-      return;
+      return null;
     }
     await store.setNickname(nick);
-    if (!mounted) return;
+    return nick;
+  }
+
+  Future<void> _join(ServerEntry s) async {
+    final nick = await _checkedNickname();
+    if (nick == null || !mounted) return;
     final session = context.read<SessionController>();
-    session.connect(host: s.host, port: s.port, nickname: nick, skin: store.skin);
+    session.connect(host: s.host, port: s.port, nickname: nick, skin: context.read<SettingsStore>().skin);
     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const GameScreen()));
-    session.close();
+    await session.close();
     _refresh();
+  }
+
+  Future<void> _playWorld(LocalWorldEntry world, bool lan) async {
+    final nick = await _checkedNickname();
+    if (nick == null || !mounted) return;
+    final session = context.read<SessionController>();
+    session.hostWorld(world: world, lan: lan, nickname: nick, skin: context.read<SettingsStore>().skin);
+    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const GameScreen()));
+    await session.close();
   }
 
   @override
@@ -147,6 +164,9 @@ class _ServersScreenState extends State<ServersScreen> {
             ),
           ),
           const SizedBox(height: 16),
+          WorldsSection(onPlay: _playWorld),
+          const SizedBox(height: 16),
+          Text('Серверы', style: Theme.of(context).textTheme.titleMedium),
           if (store.servers.isEmpty)
             const Padding(
               padding: EdgeInsets.all(24),
